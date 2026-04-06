@@ -1,0 +1,54 @@
+#!/bin/bash
+# Single-instance starter for Claude Telegram Orchestrator
+# Ensures only one bot process runs at a time
+
+set -e
+
+PIDFILE="$HOME/.claude-orchestrator/orchestrator.pid"
+TOKEN_FILE="$HOME/.claude-orchestrator/.env"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
+
+# Load token
+if [ -f "$TOKEN_FILE" ]; then
+    source "$TOKEN_FILE"
+fi
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+    echo "❌ TELEGRAM_BOT_TOKEN not set. Add it to $TOKEN_FILE or env."
+    exit 1
+fi
+export TELEGRAM_BOT_TOKEN
+
+# Kill any existing instance
+echo "🔍 Checking for existing instances..."
+
+# Kill by PID file
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "🛑 Killing existing orchestrator (PID $OLD_PID)"
+        kill -9 "$OLD_PID" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+fi
+
+# Kill by process pattern (exclude start-tmux.sh wrapper so launchd monitor survives)
+pgrep -f "claude-telegram-orchestrator/src/index" 2>/dev/null | while read pid; do
+    [ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null || true
+done
+pkill -9 -f "external_plugins/telegram/server" 2>/dev/null || true
+
+# Release Telegram's server-side polling lock
+echo "🔓 Releasing Telegram polling lock..."
+curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/close" > /dev/null 2>&1 || true
+curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true" > /dev/null 2>&1 || true
+
+# Wait for everything to settle
+echo "⏳ Waiting 5s for cleanup..."
+sleep 5
+
+# Start
+echo "🚀 Starting orchestrator..."
+cd "$PROJECT_DIR"
+exec bun run src/index.ts
