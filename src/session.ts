@@ -27,6 +27,7 @@ interface LiveSession extends SessionInfo {
 
 export class SessionManager {
   private sessions = new Map<string, LiveSession>();
+  private sessionModelOverrides = new Map<string, string>();
   private config: OrchestratorConfig;
   private logger: Logger;
   private idleCheckInterval: ReturnType<typeof setInterval> | null = null;
@@ -35,6 +36,14 @@ export class SessionManager {
     this.config = config;
     this.logger = logger;
     mkdirSync(LOGS_DIR, { recursive: true });
+  }
+
+  /**
+   * Set a model override for a session. Takes effect on next spawn.
+   */
+  setSessionModel(sessionKey: string, model: string): void {
+    this.sessionModelOverrides.set(sessionKey, model);
+    this.logger.info(`[session:${sessionKey}] Model override set to ${model}`);
   }
 
   startIdleChecker(): void {
@@ -82,6 +91,7 @@ export class SessionManager {
     const previousSessionId = meta?.sessionId as string | undefined;
     const sessionLogPath = join(LOGS_DIR, `${sessionKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`);
 
+    const model = this.sessionModelOverrides.get(sessionKey) ?? this.config.defaultModel;
     const args: string[] = [
       "claude",
       "--print",
@@ -90,8 +100,9 @@ export class SessionManager {
       "--output-format", "stream-json",
       "--include-partial-messages",
       "--permission-mode", "bypassPermissions",
-      "--model", this.config.defaultModel,
+      "--model", model,
     ];
+    this.logger.info(`[session:${sessionKey}] Using model: ${model}`);
 
     // Pass MCP config so sessions get olog and other MCP tools
     const mcpConfig = join(process.env.HOME || "/Users/oraion", ".claude", "mcp_servers.json");
@@ -201,23 +212,29 @@ export class SessionManager {
       saveSessionMeta(session.key, { sessionId: session.sessionId });
     }
 
-    // Accumulate assistant text from message events
-    if (event.type === "assistant" && event.message?.content) {
-      for (const block of event.message.content) {
-        if (block.type === "text" && block.text) {
-          session.responseText += block.text;
-        }
-      }
-      if (session.responseText && session.onDelta) {
-        session.onDelta(session.responseText);
-      }
-    }
-
-    // Content block deltas (streaming text)
+    // Content block deltas (streaming text) — append incrementally
     if (event.type === "content_block_delta" && event.delta?.text) {
       session.responseText += event.delta.text;
       if (session.onDelta) {
         session.onDelta(session.responseText);
+      }
+    }
+
+    // Full assistant message — use as authoritative text (replaces delta accumulation).
+    // This arrives after all content_block_delta events for a turn, so it contains
+    // the complete text. We REPLACE rather than append to avoid duplication.
+    // NOTE: Do NOT call onDelta again here — the deltas already delivered this text
+    // incrementally. Calling onDelta again with the same accumulated text caused
+    // duplicate messages in Telegram.
+    if (event.type === "assistant" && event.message?.content) {
+      let fullText = "";
+      for (const block of event.message.content) {
+        if (block.type === "text" && block.text) {
+          fullText += block.text;
+        }
+      }
+      if (fullText) {
+        session.responseText = fullText;
       }
     }
 
