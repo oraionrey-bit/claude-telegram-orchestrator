@@ -3,9 +3,10 @@
 import { join } from "path";
 import { loadConfig, getBotToken, getConfigDir } from "./config";
 import { SessionManager } from "./session";
-import { createBot } from "./bot";
+import { createBot, setScheduler } from "./bot";
 import { initMemory } from "./memory";
 import { initChannelLogs } from "./channel-log";
+import { Scheduler } from "./scheduler";
 import { Logger } from "./utils";
 
 const LOGS_DIR = join(getConfigDir(), "logs");
@@ -58,6 +59,11 @@ async function startOrchestrator(): Promise<void> {
   // Create and start bot
   const bot = createBot(token, config, sessionManager, logger);
 
+  // Create and start scheduler
+  const scheduler = new Scheduler(bot, logger);
+  setScheduler(scheduler);
+  scheduler.start();
+
   // Write PID file for --stop command
   const pidPath = join(getConfigDir(), "orchestrator.pid");
   await Bun.write(pidPath, process.pid.toString());
@@ -65,6 +71,7 @@ async function startOrchestrator(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down...`);
+    scheduler.stop();
     try {
       bot.stop();
     } catch {

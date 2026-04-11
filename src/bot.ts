@@ -17,6 +17,24 @@ export function setScheduler(scheduler: Scheduler): void {
   _scheduler = scheduler;
 }
 
+// ── Message batching: buffer rapid messages per session ──
+interface PendingMessage {
+  ctx: Context;
+  text: string;
+  contentBlocks: ContentBlock[];
+  senderName: string;
+  threadId?: number;
+  msgId: number;
+  replyContext?: string;
+}
+
+interface SessionBuffer {
+  messages: PendingMessage[];
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const MESSAGE_BATCH_DELAY_MS = 2500;
+
 export function createBot(
   token: string,
   config: OrchestratorConfig,
@@ -24,6 +42,7 @@ export function createBot(
   logger: Logger
 ): Bot {
   const bot = new Bot(token);
+  const sessionBuffers = new Map<string, SessionBuffer>();
 
   // ── Access control middleware ──
   bot.use(async (ctx, next) => {
@@ -80,47 +99,43 @@ export function createBot(
     await next();
   });
 
-  // ── Main message handler ──
-  bot.on("message", async (ctx) => {
-    const msg = ctx.message;
-    const text = msg.text ?? msg.caption ?? "";
-    const hasPhoto = !!(msg.photo && msg.photo.length > 0);
-    const hasDocument = !!(msg.document && msg.document.mime_type?.startsWith("image/"));
+  // ── Helper: download image from Telegram and return content block ──
+  async function downloadImage(
+    ctx: Context,
+    msg: Context["message"] & object,
+    hasPhoto: boolean
+  ): Promise<ContentBlock> {
+    const fileId = hasPhoto
+      ? msg.photo![msg.photo!.length - 1].file_id
+      : msg.document!.file_id;
+    const file = await ctx.api.getFile(fileId);
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString("base64");
 
-    // Debug: log what we received
-    logger.info(`[bot] Message keys: ${Object.keys(msg).filter(k => !["from","chat","date","message_id"].includes(k)).join(", ")} | hasPhoto=${hasPhoto} hasDocument=${hasDocument}`);
+    const ext = file.file_path?.split(".").pop()?.toLowerCase() ?? "jpg";
+    const mediaTypes: Record<string, string> = {
+      jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+      gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+    };
+    const mediaType = !hasPhoto && msg.document
+      ? (msg.document.mime_type ?? "image/jpeg")
+      : (mediaTypes[ext] ?? "image/jpeg");
 
-    // Skip empty messages (stickers, etc. without text or photos)
-    if (!text.trim() && !hasPhoto && !hasDocument) return;
+    logger.info(`[bot] Downloaded image (${Math.round(buffer.byteLength / 1024)}KB)`);
+    return {
+      type: "image",
+      source: { type: "base64", media_type: mediaType, data: base64 },
+    };
+  }
 
-    const sessionKey = getSessionKey(ctx);
-    if (!sessionKey) {
-      logger.warn("[bot] Could not determine session key");
-      return;
-    }
-
-    // ── Orchestrator-level slash commands ──
-    const trimmedText = text.trim();
-    if (trimmedText.startsWith("/")) {
-      const handled = await handleOrchestratorCommand(
-        ctx, trimmedText, sessionKey, sessionManager, config, logger
-      );
-      if (handled) return;
-      // Not an orchestrator command — fall through to Claude
-      // (Claude handles /compact, /cost, /status, etc. natively)
-    }
-
-    const senderName = getSenderName(ctx);
-    const threadId = msg.message_thread_id;
-    const chatType = msg.chat.type;
-    const isForum = "is_forum" in msg.chat ? (msg.chat as unknown as Record<string, unknown>).is_forum : false;
-    logger.info(`[bot] Message from ${senderName} → session ${sessionKey} (chat_type=${chatType}, is_forum=${isForum}, thread_id=${threadId}): ${text.slice(0, 80)}...`);
-
-    // Ack reaction
-    await sendAckReaction(ctx, config.ackReaction);
-
-    // Send typing indicator
-    await ctx.replyWithChatAction("typing");
+  // ── Process a batch of buffered messages ──
+  async function processBatch(sessionKey: string, batch: PendingMessage[]): Promise<void> {
+    // Use the last message's context for replying
+    const lastPending = batch[batch.length - 1];
+    const ctx = lastPending.ctx;
+    const threadId = lastPending.threadId;
 
     // Keep typing indicator alive during processing
     const typingInterval = setInterval(async () => {
@@ -132,52 +147,45 @@ export function createBot(
     }, 4000);
 
     try {
-      // Log inbound message
-      logInbound(sessionKey, senderName, text);
+      // Merge all content blocks from all messages in the batch
+      const allContentBlocks: ContentBlock[] = [];
 
-      // Build content blocks for Claude
-      const contentBlocks: ContentBlock[] = [];
-
-      // Download photo if present
-      if (hasPhoto || hasDocument) {
-        try {
-          const fileId = hasPhoto
-            ? msg.photo![msg.photo!.length - 1].file_id  // Largest photo size
-            : msg.document!.file_id;
-          const file = await ctx.api.getFile(fileId);
-          const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-          const response = await fetch(url);
-          const buffer = await response.arrayBuffer();
-          const base64 = Buffer.from(buffer).toString("base64");
-
-          // Determine media type
-          const ext = file.file_path?.split(".").pop()?.toLowerCase() ?? "jpg";
-          const mediaTypes: Record<string, string> = {
-            jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
-            gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
-          };
-          const mediaType = hasDocument
-            ? (msg.document!.mime_type ?? "image/jpeg")
-            : (mediaTypes[ext] ?? "image/jpeg");
-
-          contentBlocks.push({
-            type: "image",
-            source: { type: "base64", media_type: mediaType, data: base64 },
-          });
-          logger.info(`[bot] Downloaded image for session ${sessionKey} (${Math.round(buffer.byteLength / 1024)}KB)`);
-        } catch (err) {
-          logger.warn(`[bot] Failed to download image: ${err}`);
-          contentBlocks.push({ type: "text", text: "[Image could not be loaded]" });
+      for (const pending of batch) {
+        // Add image blocks first
+        for (const block of pending.contentBlocks) {
+          if (block.type === "image") {
+            allContentBlocks.push(block);
+          }
         }
       }
 
-      // Add text content
-      const formattedMessage = formatUserMessage(senderName, text || "(sent an image)");
-      contentBlocks.push({ type: "text", text: formattedMessage });
+      // Combine text from all messages into one formatted block
+      if (batch.length === 1) {
+        const pending = batch[0];
+        const msgText = pending.replyContext
+          ? `${pending.replyContext}\n${pending.text || "(sent an image)"}`
+          : (pending.text || "(sent an image)");
+        const formattedMessage = formatUserMessage(pending.senderName, msgText);
+        allContentBlocks.push({ type: "text", text: formattedMessage });
+        logInbound(sessionKey, pending.senderName, pending.text);
+      } else {
+        // Multiple messages — combine with separator
+        const combinedText = batch
+          .map((p) => {
+            const txt = p.text || "(sent an image)";
+            return p.replyContext ? `${p.replyContext}\n${txt}` : txt;
+          })
+          .filter(Boolean)
+          .join("\n\n");
+        const formattedMessage = formatUserMessage(batch[0].senderName, combinedText);
+        allContentBlocks.push({ type: "text", text: formattedMessage });
+        for (const pending of batch) {
+          logInbound(sessionKey, pending.senderName, pending.text);
+        }
+        logger.info(`[bot] Batched ${batch.length} messages for session ${sessionKey}`);
+      }
 
-      // Streaming: edit current message as text streams in. When a paragraph
-      // break (\n\n) appears, finalize that message and start a new one.
-      // At the end, just do a final edit on the last message — don't re-send.
+      // Streaming: edit current message as text streams in
       const baseOpts: Record<string, unknown> = {};
       if (threadId !== undefined) {
         baseOpts.message_thread_id = threadId;
@@ -198,7 +206,9 @@ export function createBot(
           await ctx.api.editMessageText(currentMsg.chat.id, currentMsg.message_id, display);
           lastEditText = text;
           lastEditTime = Date.now();
-        } catch {}
+        } catch (err) {
+          logger.warn(`[bot] editMessageText failed for ${sessionKey}: ${err}`);
+        }
       };
 
       const startNewMessage = async (initialText: string) => {
@@ -208,13 +218,14 @@ export function createBot(
           currentMsg = await ctx.reply(initialText || "…", baseOpts);
           lastEditTime = Date.now();
           lastEditText = initialText;
-        } catch {
+        } catch (err) {
+          logger.warn(`[bot] startNewMessage failed for ${sessionKey}: ${err}`);
           currentMsg = null;
         }
       };
 
-      // Send initial placeholder (reply to original message)
-      const firstMsgOpts = { ...baseOpts, reply_to_message_id: msg.message_id };
+      // Send initial placeholder (reply to first message in batch)
+      const firstMsgOpts = { ...baseOpts, reply_to_message_id: batch[0].msgId };
       try {
         currentMsg = await ctx.reply("…", firstMsgOpts);
         lastEditTime = Date.now();
@@ -222,13 +233,13 @@ export function createBot(
         currentMsg = null;
       }
 
-      let startingNewMsg = false; // guard against race during async startNewMessage
+      let startingNewMsg = false;
 
       const onDelta = (accumulatedText: string) => {
         if (!currentMsg || startingNewMsg) return;
 
         const newText = accumulatedText.slice(previousAccumulated.length);
-        if (!newText) return; // no new content (e.g., assistant event re-emitting same text)
+        if (!newText) return;
         previousAccumulated = accumulatedText;
         currentMsgText += newText;
 
@@ -245,7 +256,6 @@ export function createBot(
             startingNewMsg = true;
             startNewMessage(remainder).finally(() => { startingNewMsg = false; });
           } else {
-            // Paragraph break at end — reset for next paragraph
             currentMsgText = "";
           }
           return;
@@ -264,7 +274,7 @@ export function createBot(
         }
       };
 
-      const response = await sessionManager.sendMessage(sessionKey, contentBlocks, onDelta);
+      const response = await sessionManager.sendMessage(sessionKey, allContentBlocks, onDelta);
 
       if (pendingEditTimer) {
         clearTimeout(pendingEditTimer);
@@ -274,26 +284,147 @@ export function createBot(
       // Log outbound response
       logOutbound(sessionKey, response);
 
-      // Final step: just make sure the last message has its complete text.
-      // Everything else was already sent as individual paragraph messages.
+      // Final edit to ensure complete text is shown
       if (currentMsg && currentMsgText.trim()) {
         await editCurrentMsg(currentMsgText.trim());
+      }
+
+      // Safety fallback: if streaming didn't deliver anything, send full response
+      if (response && response.trim() && (!lastEditText || lastEditText === "…")) {
+        logger.warn(`[bot] Streaming delivery failed for ${sessionKey}, sending full response as fallback`);
+        try {
+          if (currentMsg) {
+            await ctx.api.deleteMessage(currentMsg.chat.id, currentMsg.message_id).catch(() => {});
+          }
+          const chunks = chunkMessage(response);
+          for (const chunk of chunks) {
+            await ctx.reply(chunk, {
+              ...baseOpts,
+              reply_to_message_id: batch[0].msgId,
+            });
+          }
+        } catch (fallbackErr) {
+          logger.error(`[bot] Fallback send also failed for ${sessionKey}: ${fallbackErr}`);
+        }
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       logger.error(`[bot] Error processing message: ${errorMsg}`);
       try {
-        await ctx.reply("⚠️ Error processing your message. Please try again.", {
-          reply_to_message_id: msg.message_id,
-          ...(msg.message_thread_id !== undefined && {
-            message_thread_id: msg.message_thread_id,
-          }),
+        await ctx.reply("Error processing your message. Please try again.", {
+          reply_to_message_id: lastPending.msgId,
+          ...(threadId !== undefined && { message_thread_id: threadId }),
         });
       } catch {
         // Can't even send error reply
       }
     } finally {
       clearInterval(typingInterval);
+    }
+  }
+
+  // ── Main message handler ──
+  bot.on("message", async (ctx) => {
+    const msg = ctx.message;
+    const text = msg.text ?? msg.caption ?? "";
+    const hasPhoto = !!(msg.photo && msg.photo.length > 0);
+    const hasDocument = !!(msg.document && msg.document.mime_type?.startsWith("image/"));
+
+    // Debug: log what we received
+    logger.info(`[bot] Message keys: ${Object.keys(msg).filter(k => !["from","chat","date","message_id"].includes(k)).join(", ")} | hasPhoto=${hasPhoto} hasDocument=${hasDocument}`);
+
+    // Skip empty messages (stickers, etc. without text or photos)
+    if (!text.trim() && !hasPhoto && !hasDocument) return;
+
+    const sessionKey = getSessionKey(ctx);
+    if (!sessionKey) {
+      logger.warn("[bot] Could not determine session key");
+      return;
+    }
+
+    // ── Orchestrator-level slash commands (never batched) ──
+    const trimmedText = text.trim();
+    if (trimmedText.startsWith("/")) {
+      const handled = await handleOrchestratorCommand(
+        ctx, trimmedText, sessionKey, sessionManager, config, logger
+      );
+      if (handled) return;
+    }
+
+    const senderName = getSenderName(ctx);
+    const threadId = msg.message_thread_id;
+    const chatType = msg.chat.type;
+    const isForum = "is_forum" in msg.chat ? (msg.chat as unknown as Record<string, unknown>).is_forum : false;
+    logger.info(`[bot] Message from ${senderName} → session ${sessionKey} (chat_type=${chatType}, is_forum=${isForum}, thread_id=${threadId}): ${text.slice(0, 80)}...`);
+
+    // Ack reaction
+    await sendAckReaction(ctx, config.ackReaction);
+
+    // Send typing indicator
+    await ctx.replyWithChatAction("typing");
+
+    // Build content blocks (download image immediately so we don't lose the ctx)
+    const contentBlocks: ContentBlock[] = [];
+    if (hasPhoto || hasDocument) {
+      try {
+        const imageBlock = await downloadImage(ctx, msg, hasPhoto);
+        contentBlocks.push(imageBlock);
+      } catch (err) {
+        logger.warn(`[bot] Failed to download image: ${err}`);
+        contentBlocks.push({ type: "text", text: "[Image could not be loaded]" });
+      }
+    }
+
+    // Extract reply-to context if this message is a reply
+    let replyContext: string | undefined;
+    if (msg.reply_to_message) {
+      const replyMsg = msg.reply_to_message;
+      const replyText = replyMsg.text ?? replyMsg.caption ?? "";
+      const replyFrom = replyMsg.from;
+      const replySender = replyFrom?.first_name
+        ? `${replyFrom.first_name}${replyFrom.last_name ? " " + replyFrom.last_name : ""}`
+        : "Unknown";
+      if (replyText) {
+        // Truncate long quoted text to keep context manageable
+        const truncated = replyText.length > 300 ? replyText.slice(0, 300) + "…" : replyText;
+        replyContext = `[Replying to ${replySender}: "${truncated}"]`;
+      }
+    }
+
+    // Buffer this message for batching
+    const pending: PendingMessage = {
+      ctx,
+      text: text || "(sent an image)",
+      contentBlocks,
+      senderName,
+      threadId,
+      msgId: msg.message_id,
+      replyContext,
+    };
+
+    const existing = sessionBuffers.get(sessionKey);
+    if (existing) {
+      // Add to existing buffer and reset timer
+      clearTimeout(existing.timer);
+      existing.messages.push(pending);
+      logger.info(`[bot] Buffered message ${existing.messages.length} for session ${sessionKey}`);
+      existing.timer = setTimeout(() => {
+        const buf = sessionBuffers.get(sessionKey);
+        if (buf) {
+          sessionBuffers.delete(sessionKey);
+          processBatch(sessionKey, buf.messages);
+        }
+      }, MESSAGE_BATCH_DELAY_MS);
+    } else {
+      // Start new buffer
+      const timer = setTimeout(() => {
+        const buf = sessionBuffers.get(sessionKey);
+        if (buf) {
+          sessionBuffers.delete(sessionKey);
+          processBatch(sessionKey, buf.messages);
+        }
+      }, MESSAGE_BATCH_DELAY_MS);
+      sessionBuffers.set(sessionKey, { messages: [pending], timer });
     }
   });
 

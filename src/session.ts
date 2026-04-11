@@ -283,15 +283,17 @@ export class SessionManager {
     return new Promise<string>((resolve) => {
       session.responseResolve = resolve;
 
-      // Safety timeout: 5 minutes
+      // Safety timeout: 10 minutes
       setTimeout(() => {
         if (session.responseResolve === resolve) {
-          this.logger.warn(`[session:${session.key}] Response timeout (5min)`);
+          this.logger.warn(`[session:${session.key}] Response timeout (10min)`);
           session.responseResolve = null;
-          resolve(session.responseText || "(response timed out)");
+          const partial = session.responseText;
           session.responseText = "";
+          session.onDelta = null;
+          resolve(partial || "(response timed out — no partial text available)");
         }
-      }, 300_000);
+      }, 600_000);
     });
   }
 

@@ -6,6 +6,7 @@ export interface OrchestratorConfig {
   maxSessions: number;
   idleTimeoutMinutes: number;
   defaultModel: string;
+  availableModels?: string[];
   groups: Record<string, GroupConfig>;
 }
 
@@ -76,6 +77,16 @@ export interface PendingMessage {
   threadId: number | undefined;
   text: string;
   senderName: string;
+}
+
+export interface ScheduleJob {
+  id: string;
+  name: string;
+  cron: string;
+  chatId: number;
+  topicId?: number;
+  message: string;
+  enabled: boolean;
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
