@@ -16,6 +16,9 @@ const LOGS_DIR = join(getConfigDir(), "logs", "sessions");
 // Callback fired on each streaming delta
 export type OnDeltaCallback = (accumulatedText: string) => void;
 
+// Callback fired when Claude invokes a tool (for progress display)
+export type OnToolUseCallback = (toolName: string, description: string) => void;
+
 // Extended session info with stdout reader state
 interface LiveSession extends SessionInfo {
   stdoutBuffer: string;
@@ -23,6 +26,7 @@ interface LiveSession extends SessionInfo {
   responseText: string;
   readerActive: boolean;
   onDelta: OnDeltaCallback | null;
+  onToolUse: OnToolUseCallback | null;
 }
 
 export class SessionManager {
@@ -64,7 +68,7 @@ export class SessionManager {
    * Returns the assistant's full text response.
    * If onDelta is provided, it's called with the accumulated text on each streaming chunk.
    */
-  async sendMessage(sessionKey: string, content: ContentBlock[], onDelta?: OnDeltaCallback): Promise<string> {
+  async sendMessage(sessionKey: string, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback): Promise<string> {
     let session = this.sessions.get(sessionKey);
 
     if (!session || !session.proc || session.proc.exitCode !== null) {
@@ -74,7 +78,7 @@ export class SessionManager {
     session.lastActivity = Date.now();
     session.messageCount++;
 
-    return this.writeAndWait(session, content, onDelta);
+    return this.writeAndWait(session, content, onDelta, onToolUse);
   }
 
   /**
@@ -139,6 +143,7 @@ export class SessionManager {
       responseText: "",
       readerActive: false,
       onDelta: null,
+      onToolUse: null,
     };
 
     this.sessions.set(sessionKey, session);
@@ -232,6 +237,43 @@ export class SessionManager {
         if (block.type === "text" && block.text) {
           fullText += block.text;
         }
+        // Detect tool use and fire progress callback
+        if (block.type === "tool_use" && block.name && session.onToolUse) {
+          const input = block.input as Record<string, unknown> | undefined;
+          let desc = "";
+          switch (block.name) {
+            case "Bash":
+              desc = (input?.description as string) || (input?.command as string)?.slice(0, 80) || "Running command";
+              break;
+            case "Read":
+              desc = (input?.file_path as string)?.split("/").slice(-2).join("/") || "Reading file";
+              break;
+            case "Edit":
+              desc = (input?.file_path as string)?.split("/").slice(-2).join("/") || "Editing file";
+              break;
+            case "Write":
+              desc = (input?.file_path as string)?.split("/").slice(-2).join("/") || "Writing file";
+              break;
+            case "Grep":
+              desc = `"${(input?.pattern as string)?.slice(0, 40) || "..."}"`;
+              break;
+            case "Glob":
+              desc = (input?.pattern as string) || "Searching files";
+              break;
+            case "WebSearch":
+              desc = (input?.query as string)?.slice(0, 60) || "Searching web";
+              break;
+            case "WebFetch":
+              desc = (input?.url as string)?.slice(0, 60) || "Fetching URL";
+              break;
+            case "Agent":
+              desc = (input?.description as string) || "Running sub-agent";
+              break;
+            default:
+              desc = block.name;
+          }
+          session.onToolUse(block.name, desc);
+        }
       }
       if (fullText) {
         session.responseText = fullText;
@@ -248,6 +290,7 @@ export class SessionManager {
         session.responseResolve = null;
         session.responseText = "";
         session.onDelta = null;
+        session.onToolUse = null;
       }
     }
   }
@@ -255,15 +298,16 @@ export class SessionManager {
   /**
    * Write a user message to stdin and wait for the response via the background reader.
    */
-  private writeAndWait(session: LiveSession, content: ContentBlock[], onDelta?: OnDeltaCallback): Promise<string> {
+  private writeAndWait(session: LiveSession, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback): Promise<string> {
     const proc = session.proc;
     if (!proc?.stdin || typeof proc.stdin === "number") {
       return Promise.resolve("(session has no stdin)");
     }
 
-    // Reset response accumulator and set delta callback
+    // Reset response accumulator and set callbacks
     session.responseText = "";
     session.onDelta = onDelta ?? null;
+    session.onToolUse = onToolUse ?? null;
 
     // Build stream-json input (requires message wrapper with role)
     const input = JSON.stringify({
@@ -291,6 +335,7 @@ export class SessionManager {
           const partial = session.responseText;
           session.responseText = "";
           session.onDelta = null;
+          session.onToolUse = null;
           resolve(partial || "(response timed out — no partial text available)");
         }
       }, 600_000);

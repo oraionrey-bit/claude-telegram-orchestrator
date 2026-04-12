@@ -2,7 +2,7 @@
 
 import { Bot, GrammyError, type Context } from "grammy";
 import type { ContentBlock, OrchestratorConfig, ScheduleJob } from "./types";
-import { SessionManager } from "./session";
+import { SessionManager, type OnToolUseCallback } from "./session";
 import { getSessionKey } from "./router";
 import { chunkMessage, formatUserMessage, Logger } from "./utils";
 import { logInbound, logOutbound } from "./channel-log";
@@ -243,6 +243,13 @@ export function createBot(
         previousAccumulated = accumulatedText;
         currentMsgText += newText;
 
+        // Clean up tool status message when real text arrives
+        if (toolUseMsg) {
+          const msg = toolUseMsg;
+          toolUseMsg = null;
+          ctx.api.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+        }
+
         // Check for paragraph break — finalize current msg, start new one
         const breakIdx = currentMsgText.indexOf("\n\n");
         if (breakIdx !== -1 && currentMsgText.length > breakIdx + 2) {
@@ -274,7 +281,43 @@ export function createBot(
         }
       };
 
-      const response = await sessionManager.sendMessage(sessionKey, allContentBlocks, onDelta);
+      // Tool use progress: show what Claude is doing between text outputs
+      // Type annotation prevents TS from narrowing to `never` across async closures
+      type TgMsg = { chat: { id: number }; message_id: number };
+      let toolUseMsg: TgMsg | null = null as TgMsg | null;
+
+      const onToolUse: OnToolUseCallback = (toolName: string, description: string) => {
+        // Update the current placeholder/message with a status line,
+        // or send a new ephemeral status message
+        const statusText = `${toolName}: ${description}`;
+
+        if (currentMsg && !currentMsgText.trim()) {
+          // Current message is still the placeholder — update it with status
+          editCurrentMsg(statusText);
+        } else {
+          // Text is already streaming — send status as a separate message
+          // that will be cleaned up when the next text arrives
+          (async () => {
+            try {
+              // Delete previous tool status message if any
+              if (toolUseMsg) {
+                await ctx.api.deleteMessage(toolUseMsg.chat.id, toolUseMsg.message_id).catch(() => {});
+              }
+              toolUseMsg = await ctx.reply(statusText, baseOpts);
+            } catch {
+              // ignore
+            }
+          })();
+        }
+      };
+
+      const response = await sessionManager.sendMessage(sessionKey, allContentBlocks, onDelta, onToolUse);
+
+      // Clean up any remaining tool status message
+      if (toolUseMsg) {
+        const tm = toolUseMsg;
+        await ctx.api.deleteMessage(tm.chat.id, tm.message_id).catch(() => {});
+      }
 
       if (pendingEditTimer) {
         clearTimeout(pendingEditTimer);
@@ -355,7 +398,7 @@ export function createBot(
     const threadId = msg.message_thread_id;
     const chatType = msg.chat.type;
     const isForum = "is_forum" in msg.chat ? (msg.chat as unknown as Record<string, unknown>).is_forum : false;
-    logger.info(`[bot] Message from ${senderName} → session ${sessionKey} (chat_type=${chatType}, is_forum=${isForum}, thread_id=${threadId}): ${text.slice(0, 80)}...`);
+    logger.info(`[bot] Message from ${senderName} → session ${sessionKey} (chat_type=${chatType}, is_forum=${isForum}, thread_id=${threadId}, msg_id=${msg.message_id}): ${text.slice(0, 80)}...`);
 
     // Ack reaction
     await sendAckReaction(ctx, config.ackReaction);
