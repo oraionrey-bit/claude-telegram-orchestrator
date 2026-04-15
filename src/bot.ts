@@ -234,23 +234,23 @@ export function createBot(
       }
 
       let startingNewMsg = false;
+      let realTextDelivered = false;
+      let queuedDelta = "";
 
-      const onDelta = (accumulatedText: string) => {
+      const processDelta = () => {
         if (!currentMsg || startingNewMsg) return;
 
-        const newText = accumulatedText.slice(previousAccumulated.length);
-        if (!newText) return;
-        previousAccumulated = accumulatedText;
-        currentMsgText += newText;
+        if (queuedDelta) {
+          currentMsgText += queuedDelta;
+          queuedDelta = "";
+        }
 
-        // Clean up tool status message when real text arrives
         if (toolUseMsg) {
           const msg = toolUseMsg;
           toolUseMsg = null;
           ctx.api.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
         }
 
-        // Check for paragraph break — finalize current msg, start new one
         const breakIdx = currentMsgText.indexOf("\n\n");
         if (breakIdx !== -1 && currentMsgText.length > breakIdx + 2) {
           const finalized = currentMsgText.slice(0, breakIdx).trim();
@@ -261,14 +261,16 @@ export function createBot(
           }
           if (remainder) {
             startingNewMsg = true;
-            startNewMessage(remainder).finally(() => { startingNewMsg = false; });
+            startNewMessage(remainder).finally(() => {
+              startingNewMsg = false;
+              if (queuedDelta) processDelta();
+            });
           } else {
             currentMsgText = "";
           }
           return;
         }
 
-        // No break — throttled edit of current message
         const now = Date.now();
         if (now - lastEditTime >= EDIT_INTERVAL_MS) {
           editCurrentMsg(currentMsgText);
@@ -281,15 +283,36 @@ export function createBot(
         }
       };
 
+      const onDelta = (accumulatedText: string) => {
+        const newText = accumulatedText.slice(previousAccumulated.length);
+        if (!newText) return;
+        previousAccumulated = accumulatedText;
+        realTextDelivered = true;
+
+        if (startingNewMsg || !currentMsg) {
+          queuedDelta += newText;
+          return;
+        }
+
+        currentMsgText += newText;
+        processDelta();
+      };
+
       // Tool use progress: show what Claude is doing between text outputs
       // Type annotation prevents TS from narrowing to `never` across async closures
       type TgMsg = { chat: { id: number }; message_id: number };
       let toolUseMsg: TgMsg | null = null as TgMsg | null;
 
       const onToolUse: OnToolUseCallback = (toolName: string, description: string) => {
-        // Update the current placeholder/message with a status line,
-        // or send a new ephemeral status message
-        const statusText = `${toolName}: ${description}`;
+        // Show user-friendly status for long-running tools, hide internal ones
+        // Skip tools that expose internal operations (API calls, commands, URLs)
+        const hiddenTools = new Set(["Bash", "WebFetch", "WebSearch", "Grep", "Glob", "Read", "Write", "Edit", "ToolSearch"]);
+        if (hiddenTools.has(toolName)) return;
+
+        // Only show user-friendly status for visible tools like Agent
+        const statusText = toolName === "Agent"
+          ? `🔍 ${description}`
+          : `⏳ Working...`;
 
         if (currentMsg && !currentMsgText.trim()) {
           // Current message is still the placeholder — update it with status
@@ -332,8 +355,8 @@ export function createBot(
         await editCurrentMsg(currentMsgText.trim());
       }
 
-      // Safety fallback: if streaming didn't deliver anything, send full response
-      if (response && response.trim() && (!lastEditText || lastEditText === "…")) {
+      // Safety fallback: if streaming didn't deliver real text, send full response
+      if (response && response.trim() && !realTextDelivered) {
         logger.warn(`[bot] Streaming delivery failed for ${sessionKey}, sending full response as fallback`);
         try {
           if (currentMsg) {
@@ -392,6 +415,28 @@ export function createBot(
         ctx, trimmedText, sessionKey, sessionManager, config, logger
       );
       if (handled) return;
+
+      // Claude Code commands — send raw without sender wrapping
+      const claudeCommands = ["/compact", "/cost", "/context", "/login", "/logout", "/doctor", "/memory"];
+      const cmd = trimmedText.split(/\s+/)[0].toLowerCase();
+      if (claudeCommands.includes(cmd)) {
+        logger.info(`[bot] Forwarding Claude command: ${trimmedText}`);
+        await ctx.replyWithChatAction("typing");
+        const response = await sessionManager.sendMessage(
+          sessionKey,
+          [{ type: "text", text: trimmedText }]
+        );
+        if (response?.trim()) {
+          const threadId = ctx.message?.message_thread_id;
+          const opts: Record<string, unknown> = {};
+          if (threadId !== undefined) opts.message_thread_id = threadId;
+          const chunks = chunkMessage(response);
+          for (const chunk of chunks) {
+            await ctx.reply(chunk, opts);
+          }
+        }
+        return;
+      }
     }
 
     const senderName = getSenderName(ctx);
