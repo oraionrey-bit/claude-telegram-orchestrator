@@ -20,6 +20,16 @@ if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
 fi
 export TELEGRAM_BOT_TOKEN
 
+# Load HTTP server auth token from vault (shared with healthy-me chat relay)
+VAULT="$HOME/.openclaw/workspace/scripts/vault"
+if [ -x "$VAULT" ]; then
+    ORCH_TOKEN=$(bash "$VAULT" get withluna-chat-token 2>/dev/null || true)
+    if [ -n "$ORCH_TOKEN" ]; then
+        export ORCHESTRATOR_HTTP_TOKEN="$ORCH_TOKEN"
+    fi
+fi
+export ORCHESTRATOR_HTTP_PORT="${ORCHESTRATOR_HTTP_PORT:-7800}"
+
 # Kill any existing instance
 echo "🔍 Checking for existing instances..."
 

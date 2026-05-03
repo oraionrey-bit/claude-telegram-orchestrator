@@ -85,7 +85,16 @@ export interface ScheduleJob {
   cron: string;
   chatId: number;
   topicId?: number;
+  /** Static text to post directly. Used when `prompt` is not set. */
   message: string;
+  /**
+   * If set, the scheduler runs this prompt through a fresh isolated Claude
+   * session ("briefing session", key `brief-{id}`) and posts the response.
+   * Lets scheduled jobs do live work (web search, tool use) instead of just
+   * sending static text. Briefing sessions are intentionally context-isolated
+   * so they can't leak between users or jobs.
+   */
+  prompt?: string;
   enabled: boolean;
 }
 

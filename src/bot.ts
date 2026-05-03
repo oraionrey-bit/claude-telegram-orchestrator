@@ -2,11 +2,14 @@
 
 import { Bot, GrammyError, type Context } from "grammy";
 import type { ContentBlock, OrchestratorConfig, ScheduleJob } from "./types";
-import { SessionManager, type OnToolUseCallback } from "./session";
-import { getSessionKey } from "./router";
+import { SessionManager } from "./session";
+import { getSessionKey, parseSessionKey } from "./router";
 import { chunkMessage, formatUserMessage, Logger } from "./utils";
 import { logInbound, logOutbound } from "./channel-log";
 import type { Scheduler } from "./scheduler";
+import type { NotificationQueue } from "./notify";
+import { getUserConfigForSession, setUserConfig } from "./user-config";
+import { markInflight, clearInflight } from "./inflight";
 
 // Admin users who can manage schedules
 const ADMIN_USERS = [717932407, 5052308275]; // Anthony, Tina
@@ -39,7 +42,8 @@ export function createBot(
   token: string,
   config: OrchestratorConfig,
   sessionManager: SessionManager,
-  logger: Logger
+  logger: Logger,
+  notifyQueue: NotificationQueue
 ): Bot {
   const bot = new Bot(token);
   const sessionBuffers = new Map<string, SessionBuffer>();
@@ -130,12 +134,135 @@ export function createBot(
     };
   }
 
+  // ── Completion-only mode: no streaming, no progress — just the final response ──
+  async function processBatchCompletionOnly(
+    sessionKey: string,
+    batch: PendingMessage[],
+    chatId: number,
+    threadId: number | undefined,
+    fallbackChatId: number | undefined,
+    fallbackThreadId: number | undefined
+  ): Promise<void> {
+    // Merge content blocks (same logic as processBatch)
+    const allContentBlocks: ContentBlock[] = [];
+    for (const pending of batch) {
+      for (const block of pending.contentBlocks) {
+        if (block.type === "image") {
+          allContentBlocks.push(block);
+        }
+      }
+    }
+
+    if (batch.length === 1) {
+      const pending = batch[0];
+      const msgText = pending.replyContext
+        ? `${pending.replyContext}\n${pending.text || "(sent an image)"}`
+        : (pending.text || "(sent an image)");
+      const formattedMessage = formatUserMessage(pending.senderName, msgText);
+      allContentBlocks.push({ type: "text", text: formattedMessage });
+      logInbound(sessionKey, pending.senderName, pending.text);
+    } else {
+      const combinedText = batch
+        .map((p) => {
+          const txt = p.text || "(sent an image)";
+          return p.replyContext ? `${p.replyContext}\n${txt}` : txt;
+        })
+        .filter(Boolean)
+        .join("\n\n");
+      const formattedMessage = formatUserMessage(batch[0].senderName, combinedText);
+      allContentBlocks.push({ type: "text", text: formattedMessage });
+      for (const pending of batch) {
+        logInbound(sessionKey, pending.senderName, pending.text);
+      }
+    }
+
+    try {
+      // Send acknowledgment so user knows we're actively working
+      await notifyQueue.send({
+        chatId,
+        threadId,
+        text: "Got it, working on this now.",
+        replyToMessageId: batch[0].msgId,
+        tag: `ack:${sessionKey}`,
+      });
+
+      // Track in-flight for crash recovery
+      markInflight({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        sessionKey,
+        chatId,
+        threadId,
+        fallbackChatId,
+        fallbackThreadId,
+        senderName: batch[0].senderName,
+        messageText: batch.map(b => b.text).join("\n"),
+        completionOnly: true,
+        timestamp: Date.now(),
+      });
+
+      // No streaming callbacks — just wait for the full response
+      const response = await sessionManager.sendMessage(sessionKey, allContentBlocks);
+      logOutbound(sessionKey, response);
+
+      if (response?.trim()) {
+        await notifyQueue.send({
+          chatId,
+          threadId,
+          text: response,
+          fallbackChatId,
+          fallbackThreadId,
+          replyToMessageId: batch[0].msgId,
+          tag: `response:${sessionKey}`,
+        });
+      }
+      clearInflight(sessionKey);
+    } catch (err) {
+      clearInflight(sessionKey);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error(`[bot] Error in completion-only processing: ${errorMsg}`);
+      await notifyQueue.send({
+        chatId,
+        threadId,
+        text: "Error processing your message. Please try again.",
+        fallbackChatId,
+        fallbackThreadId,
+        replyToMessageId: batch[batch.length - 1].msgId,
+        tag: `error:${sessionKey}`,
+      });
+    }
+  }
+
   // ── Process a batch of buffered messages ──
   async function processBatch(sessionKey: string, batch: PendingMessage[]): Promise<void> {
     // Use the last message's context for replying
     const lastPending = batch[batch.length - 1];
     const ctx = lastPending.ctx;
     const threadId = lastPending.threadId;
+
+    // Determine chat targets for notification queue fallback
+    const primaryChatId = ctx.chat!.id;
+    const parsed = parseSessionKey(sessionKey);
+    // For DM sessions, fallback to group; for group sessions, no fallback
+    // Group chat ID is configured in config.groups — use first enabled group
+    let fallbackChatId: number | undefined;
+    let fallbackThreadId: number | undefined;
+    if (parsed.type === "dm") {
+      const groupEntries = Object.entries(config.groups);
+      for (const [gid, gc] of groupEntries) {
+        if (gc.enabled) {
+          fallbackChatId = parseInt(gid);
+          break;
+        }
+      }
+    }
+
+    // Check completion-only mode
+    const senderId = ctx.from?.id?.toString();
+    const userConfig = getUserConfigForSession(sessionKey, senderId);
+    if (userConfig.completionOnly) {
+      await processBatchCompletionOnly(sessionKey, batch, primaryChatId, threadId, fallbackChatId, fallbackThreadId);
+      return;
+    }
 
     // Keep typing indicator alive during processing
     const typingInterval = setInterval(async () => {
@@ -195,7 +322,7 @@ export function createBot(
       let currentMsgText = "";
       let lastEditText = "";
       let lastEditTime = 0;
-      const EDIT_INTERVAL_MS = 1500;
+      const EDIT_INTERVAL_MS = 800;
       let pendingEditTimer: ReturnType<typeof setTimeout> | null = null;
       let previousAccumulated = "";
 
@@ -245,12 +372,6 @@ export function createBot(
           queuedDelta = "";
         }
 
-        if (toolUseMsg) {
-          const msg = toolUseMsg;
-          toolUseMsg = null;
-          ctx.api.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
-        }
-
         const breakIdx = currentMsgText.indexOf("\n\n");
         if (breakIdx !== -1 && currentMsgText.length > breakIdx + 2) {
           const finalized = currentMsgText.slice(0, breakIdx).trim();
@@ -288,6 +409,7 @@ export function createBot(
         if (!newText) return;
         previousAccumulated = accumulatedText;
         realTextDelivered = true;
+        resetSilenceTimer();
 
         if (startingNewMsg || !currentMsg) {
           queuedDelta += newText;
@@ -298,49 +420,57 @@ export function createBot(
         processDelta();
       };
 
-      // Tool use progress: show what Claude is doing between text outputs
-      // Type annotation prevents TS from narrowing to `never` across async closures
-      type TgMsg = { chat: { id: number }; message_id: number };
-      let toolUseMsg: TgMsg | null = null as TgMsg | null;
+      // Silence heartbeat: if nothing happens for 15s, show "Still working..."
+      // Claude's natural narration ("Let me check X...") streams via onDelta into
+      // the main reply, so we don't need per-tool progress messages — they only
+      // burn Telegram edit rate limits. The heartbeat covers tool-only stretches
+      // where Claude isn't narrating.
+      const SILENCE_TIMEOUT_MS = 15000;
+      let silenceTimer: ReturnType<typeof setTimeout> | null = null;
 
-      const onToolUse: OnToolUseCallback = (toolName: string, description: string) => {
-        // Show user-friendly status for long-running tools, hide internal ones
-        // Skip tools that expose internal operations (API calls, commands, URLs)
-        const hiddenTools = new Set(["Bash", "WebFetch", "WebSearch", "Grep", "Glob", "Read", "Write", "Edit", "ToolSearch"]);
-        if (hiddenTools.has(toolName)) return;
-
-        // Only show user-friendly status for visible tools like Agent
-        const statusText = toolName === "Agent"
-          ? `🔍 ${description}`
-          : `⏳ Working...`;
-
-        if (currentMsg && !currentMsgText.trim()) {
-          // Current message is still the placeholder — update it with status
-          editCurrentMsg(statusText);
-        } else {
-          // Text is already streaming — send status as a separate message
-          // that will be cleaned up when the next text arrives
-          (async () => {
-            try {
-              // Delete previous tool status message if any
-              if (toolUseMsg) {
-                await ctx.api.deleteMessage(toolUseMsg.chat.id, toolUseMsg.message_id).catch(() => {});
-              }
-              toolUseMsg = await ctx.reply(statusText, baseOpts);
-            } catch {
-              // ignore
-            }
-          })();
-        }
+      const resetSilenceTimer = () => {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        silenceTimer = setTimeout(async () => {
+          if (!currentMsg) return;
+          const heartbeatText = currentMsgText.trim()
+            ? `${currentMsgText}\n\n⏳ Still working...`
+            : "⏳ Still working...";
+          try {
+            await ctx.api.editMessageText(currentMsg.chat.id, currentMsg.message_id, heartbeatText.slice(0, 4000));
+          } catch { /* ignore */ }
+          resetSilenceTimer();
+        }, SILENCE_TIMEOUT_MS);
       };
 
-      const response = await sessionManager.sendMessage(sessionKey, allContentBlocks, onDelta, onToolUse);
+      resetSilenceTimer();
 
-      // Clean up any remaining tool status message
-      if (toolUseMsg) {
-        const tm = toolUseMsg;
-        await ctx.api.deleteMessage(tm.chat.id, tm.message_id).catch(() => {});
-      }
+      // Track in-flight for crash recovery
+      markInflight({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        sessionKey,
+        chatId: primaryChatId,
+        threadId,
+        fallbackChatId,
+        fallbackThreadId,
+        senderName: batch[0].senderName,
+        messageText: batch.map(b => b.text).join("\n"),
+        completionOnly: false,
+        timestamp: Date.now(),
+      });
+
+      // Pass a no-op onToolUse so the session's idle-timeout watchdog still gets
+      // bumped during silent tool bursts — but we deliberately don't render
+      // anything, since Claude's text deltas already narrate what's happening.
+      const response = await sessionManager.sendMessage(
+        sessionKey,
+        allContentBlocks,
+        onDelta,
+        () => {},
+        () => {},
+      );
+
+      // Clean up silence heartbeat
+      if (silenceTimer) clearTimeout(silenceTimer);
 
       if (pendingEditTimer) {
         clearTimeout(pendingEditTimer);
@@ -355,35 +485,36 @@ export function createBot(
         await editCurrentMsg(currentMsgText.trim());
       }
 
-      // Safety fallback: if streaming didn't deliver real text, send full response
+      // Safety fallback: if streaming didn't deliver real text, send full response via queue
       if (response && response.trim() && !realTextDelivered) {
-        logger.warn(`[bot] Streaming delivery failed for ${sessionKey}, sending full response as fallback`);
-        try {
-          if (currentMsg) {
-            await ctx.api.deleteMessage(currentMsg.chat.id, currentMsg.message_id).catch(() => {});
-          }
-          const chunks = chunkMessage(response);
-          for (const chunk of chunks) {
-            await ctx.reply(chunk, {
-              ...baseOpts,
-              reply_to_message_id: batch[0].msgId,
-            });
-          }
-        } catch (fallbackErr) {
-          logger.error(`[bot] Fallback send also failed for ${sessionKey}: ${fallbackErr}`);
+        logger.warn(`[bot] Streaming delivery failed for ${sessionKey}, sending full response via queue`);
+        if (currentMsg) {
+          await ctx.api.deleteMessage(currentMsg.chat.id, currentMsg.message_id).catch(() => {});
         }
+        await notifyQueue.send({
+          chatId: primaryChatId,
+          threadId,
+          text: response,
+          fallbackChatId,
+          fallbackThreadId,
+          replyToMessageId: batch[0].msgId,
+          tag: `fallback:${sessionKey}`,
+        });
       }
+      clearInflight(sessionKey);
     } catch (err) {
+      clearInflight(sessionKey);
       const errorMsg = err instanceof Error ? err.message : String(err);
       logger.error(`[bot] Error processing message: ${errorMsg}`);
-      try {
-        await ctx.reply("Error processing your message. Please try again.", {
-          reply_to_message_id: lastPending.msgId,
-          ...(threadId !== undefined && { message_thread_id: threadId }),
-        });
-      } catch {
-        // Can't even send error reply
-      }
+      await notifyQueue.send({
+        chatId: primaryChatId,
+        threadId,
+        text: "Error processing your message. Please try again.",
+        fallbackChatId,
+        fallbackThreadId,
+        replyToMessageId: lastPending.msgId,
+        tag: `error:${sessionKey}`,
+      });
     } finally {
       clearInterval(typingInterval);
     }
@@ -682,6 +813,38 @@ async function handleOrchestratorCommand(
         return true;
       }
 
+      if (subCmd === "add-brief") {
+        // /schedule add-brief <name> <min> <hour> <dom> <month> <dow> <prompt...>
+        // Like `add` but routes through Claude with web/tool access.
+        if (args.length < 8) {
+          await ctx.reply("Usage: /schedule add-brief <name> <min> <hour> <dom> <month> <dow> <prompt...>", replyOpts);
+          return true;
+        }
+        const name = args[1];
+        const cron = args.slice(2, 7).join(" ");
+        const prompt = args.slice(7).join(" ");
+        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        const chatId = ctx.chat!.id;
+        const topicId = ctx.message?.message_thread_id;
+
+        const job: ScheduleJob = {
+          id,
+          name,
+          cron,
+          chatId,
+          ...(topicId !== undefined && { topicId }),
+          message: "",  // unused for briefing jobs
+          prompt,
+          enabled: true,
+        };
+        _scheduler.addJob(job);
+        await ctx.reply(
+          `Added briefing job "${name}" (${id})\nCron: ${cron}\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? "..." : ""}`,
+          replyOpts
+        );
+        return true;
+      }
+
       if (subCmd === "remove") {
         const id = args[1];
         if (!id) {
@@ -715,7 +878,37 @@ async function handleOrchestratorCommand(
         return true;
       }
 
-      await ctx.reply("Usage:\n  /schedules — list jobs\n  /schedule add <name> <min> <hour> <dom> <month> <dow> <message>\n  /schedule remove <id>\n  /schedule toggle <id>\n  /schedule reload", replyOpts);
+      await ctx.reply("Usage:\n  /schedules — list jobs\n  /schedule add <name> <min> <hour> <dom> <month> <dow> <message>\n  /schedule add-brief <name> <min> <hour> <dom> <month> <dow> <prompt>\n     ↳ runs prompt through Claude (web search, tools), posts response\n  /schedule remove <id>\n  /schedule toggle <id>\n  /schedule reload", replyOpts);
+      return true;
+    }
+
+    case "/mode": {
+      const userId = ctx.from?.id?.toString();
+      if (!userId) {
+        await ctx.reply("Cannot determine your user ID.", replyOpts);
+        return true;
+      }
+      const modeArg = args[0]?.toLowerCase();
+      if (!modeArg) {
+        const cfg = getUserConfigForSession(sessionKey, userId);
+        await ctx.reply(
+          `Current mode: ${cfg.completionOnly ? "completion-only" : "streaming"}\n` +
+          `Usage: /mode streaming | /mode completion`,
+          replyOpts
+        );
+        return true;
+      }
+      if (modeArg === "completion" || modeArg === "completion-only") {
+        setUserConfig(userId, { completionOnly: true });
+        await ctx.reply("Switched to completion-only mode. You'll only see final responses.", replyOpts);
+        return true;
+      }
+      if (modeArg === "streaming" || modeArg === "stream") {
+        setUserConfig(userId, { completionOnly: false });
+        await ctx.reply("Switched to streaming mode. You'll see responses as they're generated.", replyOpts);
+        return true;
+      }
+      await ctx.reply("Usage: /mode streaming | /mode completion", replyOpts);
       return true;
     }
 
@@ -725,9 +918,10 @@ async function handleOrchestratorCommand(
         "  /kill — Kill current session (next msg starts fresh with resume)",
         "  /restart — Restart session (same as /kill)",
         "  /model <name> — Switch model (opus/sonnet/haiku)",
+        "  /mode <streaming|completion> — Switch response mode",
         "  /sessions — Show all active sessions",
         "  /schedules — List scheduled messages",
-        "  /schedule add|remove|toggle|reload — Manage schedules",
+        "  /schedule add|add-brief|remove|toggle|reload — Manage schedules",
         "  /help — This message",
         "",
         "Claude commands (forwarded to Claude Code):",

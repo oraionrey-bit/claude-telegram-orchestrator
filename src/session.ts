@@ -19,6 +19,9 @@ export type OnDeltaCallback = (accumulatedText: string) => void;
 // Callback fired when Claude invokes a tool (for progress display)
 export type OnToolUseCallback = (toolName: string, description: string) => void;
 
+// Callback fired when a tool completes (tool_result event or next assistant turn)
+export type OnToolCompleteCallback = (toolName: string, durationMs: number) => void;
+
 // Extended session info with stdout reader state
 interface LiveSession extends SessionInfo {
   stdoutBuffer: string;
@@ -27,6 +30,9 @@ interface LiveSession extends SessionInfo {
   readerActive: boolean;
   onDelta: OnDeltaCallback | null;
   onToolUse: OnToolUseCallback | null;
+  onToolComplete: OnToolCompleteCallback | null;
+  lastToolName: string | null;
+  lastToolStartTime: number | null;
 }
 
 export class SessionManager {
@@ -68,7 +74,7 @@ export class SessionManager {
    * Returns the assistant's full text response.
    * If onDelta is provided, it's called with the accumulated text on each streaming chunk.
    */
-  async sendMessage(sessionKey: string, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback): Promise<string> {
+  async sendMessage(sessionKey: string, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback, onToolComplete?: OnToolCompleteCallback): Promise<string> {
     let session = this.sessions.get(sessionKey);
 
     if (!session || !session.proc || session.proc.exitCode !== null) {
@@ -78,7 +84,7 @@ export class SessionManager {
     session.lastActivity = Date.now();
     session.messageCount++;
 
-    return this.writeAndWait(session, content, onDelta, onToolUse);
+    return this.writeAndWait(session, content, onDelta, onToolUse, onToolComplete);
   }
 
   /**
@@ -144,6 +150,9 @@ export class SessionManager {
       readerActive: false,
       onDelta: null,
       onToolUse: null,
+      onToolComplete: null,
+      lastToolName: null,
+      lastToolStartTime: null,
     };
 
     this.sessions.set(sessionKey, session);
@@ -219,6 +228,8 @@ export class SessionManager {
 
     // Content block deltas (streaming text) — append incrementally
     if (event.type === "content_block_delta" && event.delta?.text) {
+      // If a tool was running, it just completed (text output means we're back)
+      this.fireToolComplete(session);
       session.responseText += event.delta.text;
       if (session.onDelta) {
         session.onDelta(session.responseText);
@@ -232,6 +243,8 @@ export class SessionManager {
     // incrementally. Calling onDelta again with the same accumulated text caused
     // duplicate messages in Telegram.
     if (event.type === "assistant" && event.message?.content) {
+      // If a tool was running, it completed before this assistant turn
+      this.fireToolComplete(session);
       let fullText = "";
       for (const block of event.message.content) {
         if (block.type === "text" && block.text) {
@@ -273,6 +286,8 @@ export class SessionManager {
               desc = block.name;
           }
           session.onToolUse(block.name, desc);
+          session.lastToolName = block.name;
+          session.lastToolStartTime = Date.now();
         }
       }
       if (fullText) {
@@ -282,6 +297,7 @@ export class SessionManager {
 
     // Result = turn complete. Resolve the pending promise.
     if (event.type === "result") {
+      this.fireToolComplete(session);
       if (session.responseResolve) {
         // Prefer accumulated text from assistant events, fall back to result field
         const text = session.responseText || event.result || "(no response)";
@@ -291,14 +307,26 @@ export class SessionManager {
         session.responseText = "";
         session.onDelta = null;
         session.onToolUse = null;
+        session.onToolComplete = null;
+        session.lastToolName = null;
+        session.lastToolStartTime = null;
       }
     }
+  }
+
+  private fireToolComplete(session: LiveSession): void {
+    if (session.lastToolName && session.lastToolStartTime && session.onToolComplete) {
+      const durationMs = Date.now() - session.lastToolStartTime;
+      session.onToolComplete(session.lastToolName, durationMs);
+    }
+    session.lastToolName = null;
+    session.lastToolStartTime = null;
   }
 
   /**
    * Write a user message to stdin and wait for the response via the background reader.
    */
-  private writeAndWait(session: LiveSession, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback): Promise<string> {
+  private writeAndWait(session: LiveSession, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback, onToolComplete?: OnToolCompleteCallback): Promise<string> {
     const proc = session.proc;
     if (!proc?.stdin || typeof proc.stdin === "number") {
       return Promise.resolve("(session has no stdin)");
@@ -306,8 +334,20 @@ export class SessionManager {
 
     // Reset response accumulator and set callbacks
     session.responseText = "";
-    session.onDelta = onDelta ?? null;
-    session.onToolUse = onToolUse ?? null;
+    session.lastToolName = null;
+    session.lastToolStartTime = null;
+
+    // Idle-timeout watchdog: reset on every delta / tool event so long-running
+    // tool calls (deploys, builds) don't kill the session as long as it's producing output.
+    const IDLE_TIMEOUT_MS = 5 * 60 * 1000;   // 5 min with no activity = dead
+    const TOTAL_TIMEOUT_MS = 30 * 60 * 1000; // 30 min absolute cap
+    let lastActivity = Date.now();
+    const startedAt = Date.now();
+    const bump = () => { lastActivity = Date.now(); };
+
+    session.onDelta = onDelta ? (text: string) => { bump(); onDelta(text); } : (() => bump());
+    session.onToolUse = onToolUse ? (name: string, desc: string) => { bump(); onToolUse(name, desc); } : (() => bump());
+    session.onToolComplete = onToolComplete ? (name: string, ms: number) => { bump(); onToolComplete(name, ms); } : (() => bump());
 
     // Build stream-json input (requires message wrapper with role)
     const input = JSON.stringify({
@@ -327,18 +367,31 @@ export class SessionManager {
     return new Promise<string>((resolve) => {
       session.responseResolve = resolve;
 
-      // Safety timeout: 10 minutes
-      setTimeout(() => {
-        if (session.responseResolve === resolve) {
-          this.logger.warn(`[session:${session.key}] Response timeout (10min)`);
+      const checkInterval = setInterval(() => {
+        // Self-clear when the success path nulls responseResolve before resolving
+        if (session.responseResolve !== resolve) {
+          clearInterval(checkInterval);
+          return;
+        }
+        const idle = Date.now() - lastActivity;
+        const total = Date.now() - startedAt;
+        if (idle > IDLE_TIMEOUT_MS || total > TOTAL_TIMEOUT_MS) {
+          const reason = idle > IDLE_TIMEOUT_MS
+            ? `idle ${Math.round(idle / 1000)}s`
+            : `total ${Math.round(total / 60_000)}min`;
+          this.logger.warn(`[session:${session.key}] Response timeout (${reason})`);
+          clearInterval(checkInterval);
           session.responseResolve = null;
           const partial = session.responseText;
           session.responseText = "";
           session.onDelta = null;
           session.onToolUse = null;
+          session.onToolComplete = null;
+          session.lastToolName = null;
+          session.lastToolStartTime = null;
           resolve(partial || "(response timed out — no partial text available)");
         }
-      }, 600_000);
+      }, 30_000);
     });
   }
 

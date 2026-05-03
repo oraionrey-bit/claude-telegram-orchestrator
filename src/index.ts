@@ -7,6 +7,10 @@ import { createBot, setScheduler } from "./bot";
 import { initMemory } from "./memory";
 import { initChannelLogs } from "./channel-log";
 import { Scheduler } from "./scheduler";
+import { NotificationQueue } from "./notify";
+import { loadUserConfigs } from "./user-config";
+import { loadInflight, clearInflight } from "./inflight";
+import { startHttpServer } from "./http-server";
 import { Logger } from "./utils";
 
 const LOGS_DIR = join(getConfigDir(), "logs");
@@ -38,10 +42,11 @@ async function startOrchestrator(): Promise<void> {
   const config = loadConfig();
   logger.info(`Config loaded: ${config.allowedUsers.length} allowed users, max ${config.maxSessions} sessions`);
 
-  // Initialize memory structure
+  // Initialize memory structure and user configs
   initMemory();
   initChannelLogs();
-  logger.info("Memory and channel logs initialized");
+  loadUserConfigs();
+  logger.info("Memory, channel logs, and user configs initialized");
 
   // Get bot token
   let token: string;
@@ -52,17 +57,27 @@ async function startOrchestrator(): Promise<void> {
     process.exit(1);
   }
 
+  // Create notification queue
+  const notifyQueue = new NotificationQueue(logger);
+
   // Create session manager
   const sessionManager = new SessionManager(config, logger);
   sessionManager.startIdleChecker();
 
   // Create and start bot
-  const bot = createBot(token, config, sessionManager, logger);
+  const bot = createBot(token, config, sessionManager, logger, notifyQueue);
+
+  // Wire API into notification queue and start it
+  notifyQueue.setApi(bot.api);
+  notifyQueue.start();
 
   // Create and start scheduler
-  const scheduler = new Scheduler(bot, logger);
+  const scheduler = new Scheduler(bot, sessionManager, logger, notifyQueue);
   setScheduler(scheduler);
   scheduler.start();
+
+  // Start HTTP server (for programmatic access via Cloudflare tunnel)
+  const httpServer = startHttpServer(sessionManager, logger);
 
   // Write PID file for --stop command
   const pidPath = join(getConfigDir(), "orchestrator.pid");
@@ -71,7 +86,9 @@ async function startOrchestrator(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down...`);
+    notifyQueue.stop();
     scheduler.stop();
+    httpServer.stop();
     try {
       bot.stop();
     } catch {
@@ -203,8 +220,41 @@ async function startOrchestrator(): Promise<void> {
       try {
         await bot.start({
           drop_pending_updates: true,
-          onStart: (info) => {
+          onStart: async (info) => {
             logger.info(`Bot started as @${info.username} (${info.first_name})`);
+
+            // Recover interrupted in-flight messages
+            const stale = loadInflight();
+            if (stale.length > 0) {
+              logger.info(`[recovery] Found ${stale.length} interrupted in-flight message(s)`);
+              for (const msg of stale) {
+                logger.info(`[recovery] Recovering session ${msg.sessionKey} (from ${msg.senderName})`);
+                const recoveryPrompt = [{
+                  type: "text" as const,
+                  text: `[System: The orchestrator restarted while you were processing a message. ` +
+                    `Your previous work was interrupted. The original request from ${msg.senderName} was: ` +
+                    `"${msg.messageText.slice(0, 500)}". ` +
+                    `Please continue where you left off and provide your response.]`,
+                }];
+                try {
+                  const response = await sessionManager.sendMessage(msg.sessionKey, recoveryPrompt);
+                  if (response?.trim()) {
+                    await notifyQueue.send({
+                      chatId: msg.chatId,
+                      threadId: msg.threadId,
+                      text: response,
+                      fallbackChatId: msg.fallbackChatId,
+                      fallbackThreadId: msg.fallbackThreadId,
+                      tag: `recovery:${msg.sessionKey}`,
+                    });
+                    logger.info(`[recovery] Delivered recovered response for ${msg.sessionKey}`);
+                  }
+                } catch (err) {
+                  logger.error(`[recovery] Failed to recover ${msg.sessionKey}: ${err}`);
+                }
+                clearInflight(msg.sessionKey);
+              }
+            }
           },
         });
         return; // Clean exit
