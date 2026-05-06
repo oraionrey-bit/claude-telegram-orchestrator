@@ -10,17 +10,21 @@ const FOOD_SESSION_KEY = "food-analysis";
 const MAX_PHOTOS = 5;
 const MAX_PHOTO_SIZE = 10 * 1024 * 1024; // 10MB
 
-// Tina's PCOS-aware food prompt (mirrors the analyze-food edge function)
-const TINA_FOOD_PROMPT = `You are a nutrition analyst for Tina, a Korean female in her mid-30s with PCOS (high androgen type).
+// Food analysis prompt. Operators can override with FOOD_ANALYSIS_PROMPT env var
+// to inject user-specific context (dietary needs, target macros, cuisines, etc.).
+// The default prompt is generic and produces the same JSON shape.
+const DEFAULT_FOOD_PROMPT = `You are a nutrition analyst.
 
-Daily targets: 1,400-1,600 calories, 80-100g protein.
+You will receive ONE of three input modes:
+  (a) Photo(s) only — analyze visually
+  (b) Description only (no photo) — estimate from text using typical real-world serving sizes
+  (c) Photo(s) + description — combine both, with the description overriding the photo when they conflict (e.g., "I only had 3 pieces", "shared with another person")
 
-Analyze the food photo(s) and any user description provided. Pay close attention to:
-- Real-world serving sizes (Korean & Japanese cuisines especially)
-- User context like "I only had 3 pieces" or "shared with husband"
-- Insulin impact, inflammation, hormonal effects relevant to PCOS
+Pay close attention to:
+- Real-world serving sizes
+- User context like "I only had 3 pieces" or "shared with another person"
 
-Be conservative when uncertain about portions. Lower your confidence score rather than guessing.
+Be conservative when uncertain about portions. For text-only meals, set confidence to 0.4-0.6 (since you can't see). For clear photo meals with detailed context, confidence can reach 0.85+. Never fabricate precision.
 
 Return ONLY a JSON object (no markdown, no commentary), with this exact shape:
 {
@@ -29,9 +33,11 @@ Return ONLY a JSON object (no markdown, no commentary), with this exact shape:
   "carbs": <number, grams>,
   "fat": <number, grams>,
   "fiber": <number, grams>,
-  "confidence": <0-1>,
-  "pcos_notes": "<short 1-2 sentence note on PCOS impact>"
+  "confidence": <0-1 decimal>,
+  "notes": "<short 1-2 sentence dietary note>"
 }`;
+
+const FOOD_ANALYSIS_PROMPT = process.env.FOOD_ANALYSIS_PROMPT ?? DEFAULT_FOOD_PROMPT;
 
 function checkAuth(req: Request): boolean {
   if (!AUTH_TOKEN) return true; // No token configured = open (dev mode)
@@ -125,8 +131,10 @@ export function startHttpServer(sessionManager: SessionManager, logger: Logger):
             }
           }
 
-          if (photos.length === 0) {
-            return new Response(JSON.stringify({ error: "no photos provided" }), {
+          // Allow text-only, photo-only, OR mixed meals. Only reject if BOTH
+          // are missing (nothing to analyze). Claude handles all 3 modes fine.
+          if (photos.length === 0 && !description.trim()) {
+            return new Response(JSON.stringify({ error: "must provide photos or description" }), {
               status: 400,
               headers: { "content-type": "application/json", ...corsHeaders() },
             });
@@ -146,8 +154,8 @@ export function startHttpServer(sessionManager: SessionManager, logger: Logger):
             content.push(await fileToContentBlock(photo));
           }
           const userText = description.trim()
-            ? `${TINA_FOOD_PROMPT}\n\nUser description: ${description.trim()}`
-            : TINA_FOOD_PROMPT;
+            ? `${FOOD_ANALYSIS_PROMPT}\n\nUser description: ${description.trim()}`
+            : FOOD_ANALYSIS_PROMPT;
           content.push({ type: "text", text: userText });
 
           // Run via dedicated food-analysis session

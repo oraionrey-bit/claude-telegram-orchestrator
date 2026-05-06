@@ -98,8 +98,12 @@ async function runPdfOcrFallback(
   });
 }
 
-// Admin users who can manage schedules
-const ADMIN_USERS = [717932407, 5052308275]; // Anthony, Tina
+// Admin users who can manage schedules. Loaded from ADMIN_USERS env var
+// (comma-separated Telegram user IDs). Empty = no admins.
+const ADMIN_USERS = (process.env.ADMIN_USERS ?? "")
+  .split(",")
+  .map((s) => parseInt(s.trim(), 10))
+  .filter((n) => !isNaN(n));
 
 // Module-level scheduler reference, set after bot creation
 let _scheduler: Scheduler | null = null;
@@ -693,9 +697,36 @@ export function createBot(
       // Log outbound response
       logOutbound(sessionKey, response);
 
-      // Final edit to ensure complete text is shown
+      // Final flush — deliver complete text. If it exceeds Telegram's
+      // ~4096-char per-message limit, properly chunk it across multiple
+      // messages instead of truncating to 4000 chars + "…" (which silently
+      // dropped content past 4000 — the original bug on long messages).
       if (currentMsg && currentMsgText.trim()) {
-        await editCurrentMsg(currentMsgText.trim());
+        const finalText = currentMsgText.trim();
+        const chunks = chunkMessage(finalText, 4000);
+        if (chunks.length === 1) {
+          await editCurrentMsg(chunks[0]);
+        } else {
+          // Multi-chunk: edit current msg with chunk 0, send rest as replies.
+          // Pace at ~1.1s between sends to stay under Telegram's 1msg/sec/chat
+          // rate limit (with a touch of slack to avoid jitter rejects).
+          try {
+            await ctx.api.editMessageText(currentMsg.chat.id, currentMsg.message_id, chunks[0]);
+            lastEditText = chunks[0];
+            lastEditTime = Date.now();
+          } catch (err) {
+            logger.warn(`[bot] final flush editMessageText failed for ${sessionKey}: ${err}`);
+          }
+          for (let i = 1; i < chunks.length; i++) {
+            await new Promise((r) => setTimeout(r, 1100));
+            try {
+              currentMsg = await ctx.reply(chunks[i], baseOpts);
+            } catch (err) {
+              logger.warn(`[bot] final flush reply chunk ${i + 1}/${chunks.length} failed for ${sessionKey}: ${err}`);
+            }
+          }
+          logger.info(`[bot] Long response delivered to ${sessionKey} as ${chunks.length} chunks (${finalText.length} chars total)`);
+        }
       }
 
       // Safety fallback: if streaming didn't deliver real text, send full response via queue

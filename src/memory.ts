@@ -25,17 +25,42 @@ const DEFAULT_SHARED_FILES: Record<string, string> = {
 interface PrivateMemoryRule {
   file: string;
   allowUsers: string[];     // User IDs whose DM sessions can read this
-  allowSessions: string[];  // Exact session key patterns (e.g., "group--1003261903210-topic-176")
+  allowSessions: string[];  // Exact session key patterns (e.g., "group-{chatId}-topic-{topicId}")
 }
 
-// Privacy rules: which private files are accessible to which sessions
-const PRIVATE_MEMORY_RULES: PrivateMemoryRule[] = [
-  {
-    file: "tina-health.md",
-    allowUsers: ["5052308275"],                             // Tina's user ID
-    allowSessions: ["group--1003261903210-topic-176"],      // Health topic in OrAIon group
-  },
-];
+/**
+ * Privacy rules are loaded from the MEMORY_PRIVATE_RULES env var, which is a
+ * JSON-encoded array of PrivateMemoryRule objects. Example:
+ *
+ *   MEMORY_PRIVATE_RULES='[{"file":"alice-notes.md","allowUsers":["12345678"],"allowSessions":["group--100123-topic-5"]}]'
+ *
+ * If unset or invalid, no private files are exposed (safe default).
+ */
+function loadPrivateMemoryRules(): PrivateMemoryRule[] {
+  const raw = process.env.MEMORY_PRIVATE_RULES;
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((r): r is PrivateMemoryRule =>
+        r &&
+        typeof r === "object" &&
+        typeof r.file === "string" &&
+        Array.isArray(r.allowUsers) &&
+        Array.isArray(r.allowSessions)
+      )
+      .map((r) => ({
+        file: r.file,
+        allowUsers: r.allowUsers.map(String),
+        allowSessions: r.allowSessions.map(String),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+const PRIVATE_MEMORY_RULES: PrivateMemoryRule[] = loadPrivateMemoryRules();
 
 /**
  * Initialize the memory directory structure.

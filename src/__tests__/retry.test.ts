@@ -28,33 +28,33 @@ describe("chunkMessage", () => {
 
 describe("formatUserMessage", () => {
   it("wraps sender name in brackets", () => {
-    expect(formatUserMessage("Anthony", "hello")).toBe("[Anthony]: hello");
+    expect(formatUserMessage("Alice", "hello")).toBe("[Alice]: hello");
   });
 });
 
 describe("router", () => {
   it("sessionKeyToDir sanitizes special chars", () => {
-    expect(sessionKeyToDir("group--1003261903210-topic-1")).toBe("group--1003261903210-topic-1");
-    expect(sessionKeyToDir("dm-717932407")).toBe("dm-717932407");
+    expect(sessionKeyToDir("group--1001234567890-topic-1")).toBe("group--1001234567890-topic-1");
+    expect(sessionKeyToDir("dm-99999999")).toBe("dm-99999999");
   });
 
   it("parseSessionKey handles DM keys", () => {
-    const result = parseSessionKey("dm-717932407");
+    const result = parseSessionKey("dm-99999999");
     expect(result.type).toBe("dm");
-    expect(result.userId).toBe("717932407");
+    expect(result.userId).toBe("99999999");
   });
 
   it("parseSessionKey handles group-topic keys", () => {
-    const result = parseSessionKey("group--1003261903210-topic-1");
+    const result = parseSessionKey("group--1001234567890-topic-1");
     expect(result.type).toBe("group");
-    expect(result.chatId).toBe("-1003261903210");
+    expect(result.chatId).toBe("-1001234567890");
     expect(result.topicId).toBe("1");
   });
 
   it("parseSessionKey handles plain group keys", () => {
-    const result = parseSessionKey("group--1003261903210");
+    const result = parseSessionKey("group--1001234567890");
     expect(result.type).toBe("group");
-    expect(result.chatId).toBe("-1003261903210");
+    expect(result.chatId).toBe("-1001234567890");
   });
 });
 
@@ -107,7 +107,7 @@ describe("pgrep patterns", () => {
     // Simulate what pgrep would match
     const processNames = [
       "bun run src/index.ts",
-      "/usr/local/bin/bun /Users/oraion/Projects/claude-telegram-orchestrator/src/index.ts",
+      "/usr/local/bin/bun /home/user/Projects/claude-telegram-orchestrator/src/index.ts",
       "node claude-telegram-orchestrator",
     ];
 

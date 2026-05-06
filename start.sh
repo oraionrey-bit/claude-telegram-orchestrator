@@ -10,15 +10,23 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
 
-# Load token
+# Load env (TELEGRAM_BOT_TOKEN, ADMIN_USERS, MEMORY_PRIVATE_RULES, etc.)
 if [ -f "$TOKEN_FILE" ]; then
+    set -a  # auto-export everything sourced
     source "$TOKEN_FILE"
+    set +a
 fi
 if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
     echo "❌ TELEGRAM_BOT_TOKEN not set. Add it to $TOKEN_FILE or env."
     exit 1
 fi
 export TELEGRAM_BOT_TOKEN
+# ADMIN_USERS: comma-separated Telegram user IDs allowed to manage schedules
+export ADMIN_USERS="${ADMIN_USERS:-}"
+# MEMORY_PRIVATE_RULES: JSON-encoded array of private memory rules. See README.
+export MEMORY_PRIVATE_RULES="${MEMORY_PRIVATE_RULES:-}"
+# FOOD_ANALYSIS_PROMPT: optional override for the /analyze-food endpoint prompt
+export FOOD_ANALYSIS_PROMPT="${FOOD_ANALYSIS_PROMPT:-}"
 
 # Load HTTP server auth token from vault (shared with healthy-me chat relay)
 VAULT="$HOME/.openclaw/workspace/scripts/vault"

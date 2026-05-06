@@ -2,6 +2,7 @@
 
 import { join } from "path";
 import { mkdirSync, existsSync } from "fs";
+import { homedir } from "os";
 import { getConfigDir, loadConfig } from "./config";
 import {
   ensureSessionDir,
@@ -115,7 +116,7 @@ export class SessionManager {
     this.logger.info(`[session:${sessionKey}] Using model: ${model}`);
 
     // Pass MCP config so sessions get olog and other MCP tools
-    const mcpConfig = join(process.env.HOME || "/Users/oraion", ".claude", "mcp_servers.json");
+    const mcpConfig = join(process.env.HOME || homedir(), ".claude", "mcp_servers.json");
     if (existsSync(mcpConfig)) {
       args.push("--mcp-config", mcpConfig);
     }

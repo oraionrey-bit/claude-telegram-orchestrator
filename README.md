@@ -89,10 +89,26 @@ bun install
 
 ### Configure
 
-1. Set your bot token:
+1. Set your bot token and other env vars. Copy `.env.example` from the repo to
+   `~/.claude-orchestrator/.env` and fill in real values:
    ```bash
-   echo "TELEGRAM_BOT_TOKEN=your_token_here" > ~/.claude-orchestrator/.env
+   mkdir -p ~/.claude-orchestrator
+   cp .env.example ~/.claude-orchestrator/.env
+   $EDITOR ~/.claude-orchestrator/.env
    ```
+
+   Supported env vars:
+
+   | Var | Required | Description |
+   |---|---|---|
+   | `TELEGRAM_BOT_TOKEN` | yes | Bot token from @BotFather |
+   | `ADMIN_USERS` | no | Comma-separated Telegram user IDs allowed to manage schedules |
+   | `MEMORY_PRIVATE_RULES` | no | JSON array describing per-file access rules for `~/.claude-orchestrator/memory/private/` (see `.env.example`) |
+   | `FOOD_ANALYSIS_PROMPT` | no | Override for `/analyze-food` HTTP endpoint prompt (must produce same JSON shape) |
+   | `ORCHESTRATOR_HTTP_PORT` | no | Port for the HTTP server (default `7800`) |
+   | `ORCHESTRATOR_HTTP_TOKEN` | no | Bearer token gating `/analyze-food`. If unset, endpoint is open. |
+
+   `start.sh` auto-exports everything in `~/.claude-orchestrator/.env`.
 
 2. Edit config:
    ```bash
@@ -158,9 +174,9 @@ bun run stop           # Graceful shutdown
 
 | Chat Type | Session Key | Example |
 |-----------|-------------|---------|
-| DM | `dm-{user_id}` | `dm-717932407` |
-| Group (no topics) | `group-{chat_id}` | `group--1003261903210` |
-| Forum topic | `group-{chat_id}-topic-{topic_id}` | `group--1003261903210-topic-276` |
+| DM | `dm-{user_id}` | `dm-12345678` |
+| Group (no topics) | `group-{chat_id}` | `group--1001234567890` |
+| Forum topic | `group-{chat_id}-topic-{topic_id}` | `group--1001234567890-topic-276` |
 
 ## Memory Layout
 
@@ -174,7 +190,7 @@ bun run stop           # Graceful shutdown
 │   ├── orchestrator.log     # Main bot log
 │   ├── launchd-stdout.log   # launchd wrapper output
 │   └── sessions/            # Per-session stderr logs
-│       ├── dm-717932407.log
+│       ├── dm-12345678.log
 │       └── ...
 └── memory/
     ├── shared/              # Read by all sessions
@@ -184,7 +200,7 @@ bun run stop           # Graceful shutdown
     ├── private/             # Access-controlled per session
     │   └── tina-health.md   # Example: private health data
     └── sessions/            # Per-session isolated state
-        ├── dm-717932407/
+        ├── dm-12345678/
         │   ├── meta.json    # Session ID for --resume
         │   └── workdir/     # Claude Code cwd
         │       ├── CLAUDE.md → ../../CLAUDE.md (symlink)

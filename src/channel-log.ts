@@ -4,9 +4,10 @@
 
 import { appendFileSync, mkdirSync, existsSync } from "fs";
 import { join, dirname } from "path";
+import { homedir } from "os";
 
 const CHANNEL_LOGS_DIR = join(
-  process.env.HOME ?? "/Users/oraion",
+  process.env.HOME ?? homedir(),
   ".oraion",
   "channel-logs"
 );
