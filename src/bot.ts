@@ -1,6 +1,10 @@
 // ── Grammy bot setup & message handlers ──
 
 import { Bot, GrammyError, type Context } from "grammy";
+import { spawn } from "node:child_process";
+import { mkdir, writeFile, unlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ContentBlock, OrchestratorConfig, ScheduleJob } from "./types";
 import { SessionManager } from "./session";
 import { getSessionKey, parseSessionKey } from "./router";
@@ -10,6 +14,89 @@ import type { Scheduler } from "./scheduler";
 import type { NotificationQueue } from "./notify";
 import { getUserConfigForSession, setUserConfig } from "./user-config";
 import { markInflight, clearInflight } from "./inflight";
+
+// Path to the pdf-read skill (text + OCR fallback). Used when pdfjs returns
+// empty/sparse text (image-based scanned PDFs).
+const PDF_READ_SKILL = join(homedir(), ".openclaw/workspace/skills/pdf-read/extract.sh");
+const PDF_OCR_TIMEOUT_MS = 5 * 60 * 1000; // 5 min hard cap for OCR work
+const PDF_OCR_MAX_PAGES = 60;             // OCR is slow; cap aggressively for chat use
+
+/**
+ * Run the pdf-read skill on a buffer. Writes the buffer to a tmp file,
+ * shells out to extract.sh, returns the extracted text (or null on failure).
+ * Always cleans up the tmp file.
+ */
+async function runPdfOcrFallback(
+  buffer: ArrayBuffer,
+  filename: string,
+  logger: Logger
+): Promise<string | null> {
+  const tmpDir = join(tmpdir(), "orchestrator-pdfs");
+  try {
+    await mkdir(tmpDir, { recursive: true });
+  } catch {
+    /* mkdir -p semantics — ignore */
+  }
+  const tmpPath = join(
+    tmpDir,
+    `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`
+  );
+
+  try {
+    await writeFile(tmpPath, Buffer.from(buffer));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.warn(`[bot] OCR fallback: failed to write tmp PDF: ${errMsg}`);
+    return null;
+  }
+
+  return new Promise<string | null>((resolve) => {
+    const child = spawn(
+      "bash",
+      [PDF_READ_SKILL, tmpPath, "--quiet", "--max-pages", String(PDF_OCR_MAX_PAGES)],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf-8"); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf-8"); });
+
+    const killTimer = setTimeout(() => {
+      logger.warn(`[bot] OCR fallback: timeout after ${PDF_OCR_TIMEOUT_MS}ms — killing`);
+      child.kill("SIGKILL");
+    }, PDF_OCR_TIMEOUT_MS);
+
+    const cleanup = async () => {
+      try { await unlink(tmpPath); } catch { /* best effort */ }
+    };
+
+    child.on("error", async (err) => {
+      clearTimeout(killTimer);
+      logger.warn(`[bot] OCR fallback: spawn error: ${err.message}`);
+      await cleanup();
+      resolve(null);
+    });
+
+    child.on("close", async (code) => {
+      clearTimeout(killTimer);
+      await cleanup();
+      if (code !== 0) {
+        logger.warn(`[bot] OCR fallback: exit ${code}; stderr: ${stderr.trim().slice(0, 500)}`);
+        resolve(null);
+        return;
+      }
+      const trimmed = stdout.trim();
+      if (!trimmed) {
+        logger.warn(`[bot] OCR fallback: empty stdout (stderr: ${stderr.trim().slice(0, 200)})`);
+        resolve(null);
+        return;
+      }
+      logger.info(`[bot] OCR fallback: extracted ${trimmed.length} chars from ${filename}`);
+      resolve(trimmed);
+    });
+  });
+}
 
 // Admin users who can manage schedules
 const ADMIN_USERS = [717932407, 5052308275]; // Anthony, Tina
@@ -134,6 +221,124 @@ export function createBot(
     };
   }
 
+  // ── Helper: download a PDF (or other text-extractable document) and return a text content block ──
+  // Caps extracted text to MAX_PDF_TEXT_CHARS to avoid blowing the model context.
+  // On any failure, returns a friendly stub so Claude knows an attachment was sent.
+  const MAX_PDF_TEXT_CHARS = 100_000;
+  const MAX_PDF_BYTES = 25 * 1024 * 1024; // 25MB — Telegram bot getFile cap is 20MB anyway
+
+  async function downloadDocumentAsText(
+    ctx: Context,
+    msg: Context["message"] & object
+  ): Promise<ContentBlock> {
+    const doc = msg.document!;
+    const filename = doc.file_name ?? "document";
+    const mimeType = doc.mime_type ?? "";
+
+    try {
+      if (doc.file_size && doc.file_size > MAX_PDF_BYTES) {
+        logger.warn(`[bot] Document too large: ${filename} (${doc.file_size} bytes)`);
+        return {
+          type: "text",
+          text: `[Document received: ${filename} — too large to process (${Math.round(doc.file_size / 1024 / 1024)}MB)]`,
+        };
+      }
+
+      const file = await ctx.api.getFile(doc.file_id);
+      const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+      const response = await fetch(url);
+      const buffer = await response.arrayBuffer();
+
+      const ext = (file.file_path ?? filename).split(".").pop()?.toLowerCase() ?? "";
+      const isPdf = mimeType === "application/pdf" || ext === "pdf";
+      const isPlainText =
+        mimeType.startsWith("text/") ||
+        ext === "txt" || ext === "md" || ext === "markdown" ||
+        ext === "csv" || ext === "log" || ext === "json" || ext === "xml" ||
+        ext === "yaml" || ext === "yml";
+
+      let extracted = "";
+
+      if (isPdf) {
+        // Tier 1 — pdfjs text-layer extraction (fast, works for digital PDFs).
+        // pdfjs DETACHES the underlying ArrayBuffer when it ingests data, so we
+        // pass a COPY (.slice(0) on the ArrayBuffer) — keeps the original buffer
+        // alive for the OCR fallback below. Without this copy, OCR fails with
+        // "Buffer is detached".
+        const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+        const loadingTask = pdfjsLib.getDocument({
+          data: new Uint8Array(buffer.slice(0)),
+          // Server-side text extraction: skip font / system-font work
+          disableFontFace: true,
+          useSystemFonts: false,
+        });
+        const pdfDoc = await loadingTask.promise;
+        const numPages = pdfDoc.numPages;
+        const parts: string[] = [];
+        let textBodyLen = 0;
+        for (let i = 1; i <= numPages; i++) {
+          const page = await pdfDoc.getPage(i);
+          const content = await page.getTextContent();
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const pageText = content.items.map((it: any) => it.str ?? "").join(" ");
+          parts.push(`--- Page ${i} ---\n${pageText}`);
+          textBodyLen += pageText.trim().length;
+          if (parts.join("\n\n").length > MAX_PDF_TEXT_CHARS) break;
+        }
+        extracted = parts.join("\n\n");
+        logger.info(`[bot] Extracted PDF text: ${filename} (${numPages} pages, ${extracted.length} chars, body ${textBodyLen} chars)`);
+
+        // Tier 2 — OCR fallback when the text layer is empty or sparse.
+        // Trigger if avg body text < 50 chars/page (matches scanned PDFs where
+        // pdfjs returns mostly whitespace and page headers).
+        const sparseThreshold = 50 * numPages;
+        if (textBodyLen < sparseThreshold) {
+          logger.info(`[bot] PDF text layer sparse (${textBodyLen} < ${sparseThreshold} chars across ${numPages} pages) — running OCR fallback`);
+          const ocrText = await runPdfOcrFallback(buffer, filename, logger);
+          if (ocrText && ocrText.length > textBodyLen) {
+            extracted = ocrText;
+            logger.info(`[bot] OCR fallback succeeded for ${filename} (${ocrText.length} chars)`);
+          } else if (!ocrText) {
+            logger.warn(`[bot] OCR fallback failed for ${filename}; passing stub message`);
+            return {
+              type: "text",
+              text: `[PDF received: ${filename} (${numPages} pages) — text extraction + OCR both failed. The file may be encrypted, corrupted, or contain only handwriting.]`,
+            };
+          }
+        }
+      } else if (isPlainText) {
+        extracted = Buffer.from(buffer).toString("utf-8");
+        logger.info(`[bot] Loaded text document: ${filename} (${extracted.length} chars)`);
+      } else {
+        logger.warn(`[bot] Unsupported document type: ${filename} (mime=${mimeType})`);
+        return {
+          type: "text",
+          text: `[Document received: ${filename} (${mimeType || "unknown type"}) — text extraction not supported]`,
+        };
+      }
+
+      const trimmed = extracted.trim();
+      if (!trimmed) {
+        return {
+          type: "text",
+          text: `[Document received: ${filename}, but no text could be extracted (image-only PDF or empty document)]`,
+        };
+      }
+
+      const truncated = trimmed.length > MAX_PDF_TEXT_CHARS;
+      const finalText = truncated ? trimmed.slice(0, MAX_PDF_TEXT_CHARS) : trimmed;
+      const header = `[Document attached: ${filename} (${isPdf ? "PDF" : mimeType || ext})${truncated ? `, truncated to ${MAX_PDF_TEXT_CHARS} chars of ${trimmed.length}` : ""}]`;
+      return { type: "text", text: `${header}\n\n${finalText}` };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[bot] Document extraction failed for ${filename}: ${errMsg}`);
+      return {
+        type: "text",
+        text: `[Document received: ${filename}, but text extraction failed: ${errMsg}]`,
+      };
+    }
+  }
+
   // ── Completion-only mode: no streaming, no progress — just the final response ──
   async function processBatchCompletionOnly(
     sessionKey: string,
@@ -143,28 +348,33 @@ export function createBot(
     fallbackChatId: number | undefined,
     fallbackThreadId: number | undefined
   ): Promise<void> {
-    // Merge content blocks (same logic as processBatch)
+    // Merge content blocks (same logic as processBatch).
+    // Images go first, then any extracted-document text blocks, then the user's
+    // own text — matches the expected order Claude sees in multimodal turns.
     const allContentBlocks: ContentBlock[] = [];
     for (const pending of batch) {
       for (const block of pending.contentBlocks) {
-        if (block.type === "image") {
-          allContentBlocks.push(block);
-        }
+        if (block.type === "image") allContentBlocks.push(block);
+      }
+    }
+    for (const pending of batch) {
+      for (const block of pending.contentBlocks) {
+        if (block.type === "text") allContentBlocks.push(block);
       }
     }
 
     if (batch.length === 1) {
       const pending = batch[0];
       const msgText = pending.replyContext
-        ? `${pending.replyContext}\n${pending.text || "(sent an image)"}`
-        : (pending.text || "(sent an image)");
+        ? `${pending.replyContext}\n${pending.text || "(sent an attachment)"}`
+        : (pending.text || "(sent an attachment)");
       const formattedMessage = formatUserMessage(pending.senderName, msgText);
       allContentBlocks.push({ type: "text", text: formattedMessage });
       logInbound(sessionKey, pending.senderName, pending.text);
     } else {
       const combinedText = batch
         .map((p) => {
-          const txt = p.text || "(sent an image)";
+          const txt = p.text || "(sent an attachment)";
           return p.replyContext ? `${p.replyContext}\n${txt}` : txt;
         })
         .filter(Boolean)
@@ -274,15 +484,18 @@ export function createBot(
     }, 4000);
 
     try {
-      // Merge all content blocks from all messages in the batch
+      // Merge all content blocks from all messages in the batch.
+      // Order: images → extracted-document text → the user's own text.
       const allContentBlocks: ContentBlock[] = [];
 
       for (const pending of batch) {
-        // Add image blocks first
         for (const block of pending.contentBlocks) {
-          if (block.type === "image") {
-            allContentBlocks.push(block);
-          }
+          if (block.type === "image") allContentBlocks.push(block);
+        }
+      }
+      for (const pending of batch) {
+        for (const block of pending.contentBlocks) {
+          if (block.type === "text") allContentBlocks.push(block);
         }
       }
 
@@ -290,8 +503,8 @@ export function createBot(
       if (batch.length === 1) {
         const pending = batch[0];
         const msgText = pending.replyContext
-          ? `${pending.replyContext}\n${pending.text || "(sent an image)"}`
-          : (pending.text || "(sent an image)");
+          ? `${pending.replyContext}\n${pending.text || "(sent an attachment)"}`
+          : (pending.text || "(sent an attachment)");
         const formattedMessage = formatUserMessage(pending.senderName, msgText);
         allContentBlocks.push({ type: "text", text: formattedMessage });
         logInbound(sessionKey, pending.senderName, pending.text);
@@ -299,7 +512,7 @@ export function createBot(
         // Multiple messages — combine with separator
         const combinedText = batch
           .map((p) => {
-            const txt = p.text || "(sent an image)";
+            const txt = p.text || "(sent an attachment)";
             return p.replyContext ? `${p.replyContext}\n${txt}` : txt;
           })
           .filter(Boolean)
@@ -525,10 +738,25 @@ export function createBot(
     const msg = ctx.message;
     const text = msg.text ?? msg.caption ?? "";
     const hasPhoto = !!(msg.photo && msg.photo.length > 0);
-    const hasDocument = !!(msg.document && msg.document.mime_type?.startsWith("image/"));
+    // Documents we accept:
+    //   - images sent as documents (uncompressed photos)  → image content block
+    //   - PDFs                                             → text content block (extracted)
+    //   - plain text / markdown / csv / json / yaml       → text content block (raw)
+    const docMime = msg.document?.mime_type ?? "";
+    const docName = msg.document?.file_name ?? "";
+    const docExt = docName.split(".").pop()?.toLowerCase() ?? "";
+    const hasImageDocument = !!msg.document && docMime.startsWith("image/");
+    const hasPdfDocument =
+      !!msg.document && (docMime === "application/pdf" || docExt === "pdf");
+    const hasTextDocument =
+      !!msg.document && (
+        docMime.startsWith("text/") ||
+        ["txt", "md", "markdown", "csv", "log", "json", "xml", "yaml", "yml"].includes(docExt)
+      );
+    const hasDocument = hasImageDocument || hasPdfDocument || hasTextDocument;
 
     // Debug: log what we received
-    logger.info(`[bot] Message keys: ${Object.keys(msg).filter(k => !["from","chat","date","message_id"].includes(k)).join(", ")} | hasPhoto=${hasPhoto} hasDocument=${hasDocument}`);
+    logger.info(`[bot] Message keys: ${Object.keys(msg).filter(k => !["from","chat","date","message_id"].includes(k)).join(", ")} | hasPhoto=${hasPhoto} hasImageDoc=${hasImageDocument} hasPdfDoc=${hasPdfDocument} hasTextDoc=${hasTextDocument} mime=${docMime}`);
 
     // Skip empty messages (stickers, etc. without text or photos)
     if (!text.trim() && !hasPhoto && !hasDocument) return;
@@ -582,15 +810,27 @@ export function createBot(
     // Send typing indicator
     await ctx.replyWithChatAction("typing");
 
-    // Build content blocks (download image immediately so we don't lose the ctx)
+    // Build content blocks (download attachment immediately so we don't lose the ctx)
     const contentBlocks: ContentBlock[] = [];
-    if (hasPhoto || hasDocument) {
+    if (hasPhoto || hasImageDocument) {
       try {
         const imageBlock = await downloadImage(ctx, msg, hasPhoto);
         contentBlocks.push(imageBlock);
       } catch (err) {
         logger.warn(`[bot] Failed to download image: ${err}`);
         contentBlocks.push({ type: "text", text: "[Image could not be loaded]" });
+      }
+    } else if (hasPdfDocument || hasTextDocument) {
+      try {
+        const docBlock = await downloadDocumentAsText(ctx, msg);
+        contentBlocks.push(docBlock);
+      } catch (err) {
+        logger.warn(`[bot] Failed to download document: ${err}`);
+        const fname = msg.document?.file_name ?? "document";
+        contentBlocks.push({
+          type: "text",
+          text: `[Document received: ${fname}, but could not be loaded]`,
+        });
       }
     }
 
@@ -611,9 +851,14 @@ export function createBot(
     }
 
     // Buffer this message for batching
+    const defaultEmptyText = hasPhoto || hasImageDocument
+      ? "(sent an image)"
+      : (hasPdfDocument || hasTextDocument)
+        ? `(sent a document: ${msg.document?.file_name ?? "document"})`
+        : "";
     const pending: PendingMessage = {
       ctx,
-      text: text || "(sent an image)",
+      text: text || defaultEmptyText,
       contentBlocks,
       senderName,
       threadId,

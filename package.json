@@ -10,7 +10,8 @@
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {
-    "grammy": "^1.42.0"
+    "grammy": "^1.42.0",
+    "pdfjs-dist": "^5.7.284"
   },
   "devDependencies": {
     "@types/bun": "latest",
