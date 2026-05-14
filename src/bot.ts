@@ -438,14 +438,19 @@ export function createBot(
     }
 
     try {
+      logger.info(`[bot] completion-only START for ${sessionKey} (batch=${batch.length}, chat=${chatId})`);
+
       // Send acknowledgment so user knows we're actively working
-      await notifyQueue.send({
+      const ackOk = await notifyQueue.send({
         chatId,
         threadId,
         text: "Got it, working on this now.",
         replyToMessageId: batch[0].msgId,
         tag: `ack:${sessionKey}`,
       });
+      if (!ackOk) {
+        logger.warn(`[bot] completion-only ack send returned false for ${sessionKey} (queued for retry)`);
+      }
 
       // Track in-flight for crash recovery
       markInflight({
@@ -466,21 +471,32 @@ export function createBot(
       logOutbound(sessionKey, response);
 
       if (response?.trim()) {
-        await notifyQueue.send({
+        const responseText = response.trim();
+        logger.info(`[bot] completion-only DELIVERING ${sessionKey} (chars=${responseText.length})`);
+        const sent = await notifyQueue.send({
           chatId,
           threadId,
-          text: response,
+          text: responseText,
           fallbackChatId,
           fallbackThreadId,
           replyToMessageId: batch[0].msgId,
           tag: `response:${sessionKey}`,
         });
+        if (sent) {
+          logger.info(`[bot] completion-only DELIVERED ${sessionKey} (chars=${responseText.length}) immediately`);
+        } else {
+          // notifyQueue has queued it for retry — log loudly so it's visible.
+          logger.error(`[bot] completion-only DELIVERY DEFERRED for ${sessionKey} (chars=${responseText.length}) — notifyQueue will retry. If this persists, the user will not see the response.`);
+        }
+      } else {
+        logger.warn(`[bot] completion-only EMPTY RESPONSE for ${sessionKey} — nothing to deliver`);
       }
       clearInflight(sessionKey);
     } catch (err) {
       clearInflight(sessionKey);
       const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.error(`[bot] Error in completion-only processing: ${errorMsg}`);
+      const errStack = err instanceof Error ? err.stack : "";
+      logger.error(`[bot] Error in completion-only processing for ${sessionKey}: ${errorMsg}${errStack ? `\n${errStack}` : ""}`);
       await notifyQueue.send({
         chatId,
         threadId,
@@ -590,6 +606,32 @@ export function createBot(
       let pendingEditTimer: ReturnType<typeof setTimeout> | null = null;
       let previousAccumulated = "";
 
+      // ── Delivery tracking (BUG FIX: long messages were silently dropped) ──
+      // deliveredFinalized: text from messages that have been "finalized" (paragraph
+      //   committed, then we moved on to a new Telegram message). These represent
+      //   confirmed-delivered content from the user's perspective.
+      // deliveryFailures: count of editMessageText/reply errors during streaming.
+      // streamingBroken: set true if currentMsg becomes null mid-stream (fatal —
+      //   we've lost our edit handle and any further deltas would be invisible).
+      const deliveredFinalized: string[] = [];
+      let deliveryFailures = 0;
+      let streamingBroken = false;
+
+      // Classifier for Telegram edit errors. Some 400s are benign no-ops, not
+      // real delivery failures — counting them as failures triggers spurious
+      // reconciliation fallbacks and DUPLICATE messages to the user.
+      //   - "message is not modified" → identical content already on screen, fine
+      //   - "message to edit not found" → message was deleted/expired, FATAL for
+      //       streaming (we've lost our edit handle, any further deltas to this
+      //       message vanish). Treat as streamingBroken so reconciliation fires.
+      const classifyEditError = (err: unknown): "ignore" | "broken" | "fail" => {
+        const s = String(err).toLowerCase();
+        if (s.includes("message is not modified")) return "ignore";
+        if (s.includes("message to edit not found") || s.includes("message to edit not")) return "broken";
+        if (s.includes("not found")) return "broken";  // covers "Bad Request: not Found"
+        return "fail";
+      };
+
       const editCurrentMsg = async (text: string) => {
         if (!currentMsg || text === lastEditText) return;
         const display = text.length > 4000 ? text.slice(0, 4000) + "\n\n…" : text;
@@ -598,11 +640,36 @@ export function createBot(
           lastEditText = text;
           lastEditTime = Date.now();
         } catch (err) {
-          logger.warn(`[bot] editMessageText failed for ${sessionKey}: ${err}`);
+          const kind = classifyEditError(err);
+          if (kind === "ignore") {
+            // Content already on screen (likely from silence heartbeat).
+            // Sync lastEditText so we stop retrying the same edit.
+            lastEditText = text;
+            lastEditTime = Date.now();
+            return;
+          }
+          if (kind === "broken") {
+            // Lost our edit handle — any further deltas to this msg are invisible.
+            // Drop currentMsg so processDelta opens a new one for subsequent text.
+            streamingBroken = true;
+            logger.error(`[bot] editMessageText: message gone for ${sessionKey} (chars=${text.length}) — marking streamingBroken: ${err}`);
+            currentMsg = null;
+            return;
+          }
+          deliveryFailures++;
+          // Log at ERROR (not WARN) so silent drops are visible. Include text size
+          // so we can correlate with response length when reconciling.
+          logger.error(`[bot] editMessageText failed for ${sessionKey} (chars=${text.length}, failures=${deliveryFailures}): ${err}`);
         }
       };
 
       const startNewMessage = async (initialText: string) => {
+        // Before we move on, the previously-edited text in lastEditText is now
+        // "finalized" — it's the content of an older Telegram message we won't
+        // touch again. Record it as delivered.
+        if (lastEditText) {
+          deliveredFinalized.push(lastEditText);
+        }
         currentMsgText = initialText;
         lastEditText = "";
         try {
@@ -610,7 +677,9 @@ export function createBot(
           lastEditTime = Date.now();
           lastEditText = initialText;
         } catch (err) {
-          logger.warn(`[bot] startNewMessage failed for ${sessionKey}: ${err}`);
+          deliveryFailures++;
+          streamingBroken = true;
+          logger.error(`[bot] startNewMessage failed for ${sessionKey} (chars=${initialText.length}, failures=${deliveryFailures}) — streaming broken, will reconcile at end: ${err}`);
           currentMsg = null;
         }
       };
@@ -620,7 +689,10 @@ export function createBot(
       try {
         currentMsg = await ctx.reply("…", firstMsgOpts);
         lastEditTime = Date.now();
-      } catch {
+      } catch (err) {
+        deliveryFailures++;
+        streamingBroken = true;
+        logger.error(`[bot] initial placeholder ctx.reply failed for ${sessionKey} — streaming broken from the start: ${err}`);
         currentMsg = null;
       }
 
@@ -699,9 +771,25 @@ export function createBot(
           const heartbeatText = currentMsgText.trim()
             ? `${currentMsgText}\n\n⏳ Still working...`
             : "⏳ Still working...";
+          const display = heartbeatText.slice(0, 4000);
           try {
-            await ctx.api.editMessageText(currentMsg.chat.id, currentMsg.message_id, heartbeatText.slice(0, 4000));
-          } catch { /* ignore */ }
+            await ctx.api.editMessageText(currentMsg.chat.id, currentMsg.message_id, display);
+            // Sync lastEditText to whatever's on screen. Without this, the NEXT
+            // streaming edit can collide with the heartbeat content and produce
+            // a "message is not modified" 400 that used to count as a delivery
+            // failure → spurious reconciliation fallback → duplicate messages.
+            lastEditText = display;
+            lastEditTime = Date.now();
+          } catch (err) {
+            // Heartbeat is best-effort. If the message is gone, mark streaming
+            // broken so reconciliation kicks in instead of silently dropping.
+            const s = String(err).toLowerCase();
+            if (s.includes("not found") || s.includes("message to edit")) {
+              streamingBroken = true;
+              currentMsg = null;
+              logger.warn(`[bot] heartbeat: message gone for ${sessionKey} — marking streamingBroken`);
+            }
+          }
           resetSilenceTimer();
         }, SILENCE_TIMEOUT_MS);
       };
@@ -748,49 +836,129 @@ export function createBot(
       // ~4096-char per-message limit, properly chunk it across multiple
       // messages instead of truncating to 4000 chars + "…" (which silently
       // dropped content past 4000 — the original bug on long messages).
+      let finalChunkSucceeded = false;
       if (currentMsg && currentMsgText.trim()) {
         const finalText = currentMsgText.trim();
         const chunks = chunkMessage(finalText, 4000);
         if (chunks.length === 1) {
+          // editCurrentMsg updates lastEditText on success → captured below
           await editCurrentMsg(chunks[0]);
+          finalChunkSucceeded = lastEditText === chunks[0];
         } else {
           // Multi-chunk: edit current msg with chunk 0, send rest as replies.
           // Pace at ~1.1s between sends to stay under Telegram's 1msg/sec/chat
           // rate limit (with a touch of slack to avoid jitter rejects).
+          let chunk0Ok = false;
           try {
             await ctx.api.editMessageText(currentMsg.chat.id, currentMsg.message_id, chunks[0]);
             lastEditText = chunks[0];
             lastEditTime = Date.now();
+            chunk0Ok = true;
           } catch (err) {
-            logger.warn(`[bot] final flush editMessageText failed for ${sessionKey}: ${err}`);
+            deliveryFailures++;
+            logger.error(`[bot] final flush editMessageText failed for ${sessionKey} (chars=${chunks[0].length}): ${err}`);
           }
+          // Push chunks[0..n-1] into deliveredFinalized; reserve the LAST
+          // successfully-delivered chunk for lastEditText so the reconciliation
+          // math (`[...deliveredFinalized, lastEditText].join("\n\n")`) doesn't
+          // double-count the final chunk.
+          let allChunksOk = chunk0Ok;
+          let lastDeliveredChunk = chunk0Ok ? chunks[0] : "";
           for (let i = 1; i < chunks.length; i++) {
             await new Promise((r) => setTimeout(r, 1100));
             try {
+              // Push the PREVIOUS lastDeliveredChunk now that we're moving past it.
+              if (lastDeliveredChunk) deliveredFinalized.push(lastDeliveredChunk);
               currentMsg = await ctx.reply(chunks[i], baseOpts);
+              lastDeliveredChunk = chunks[i];
             } catch (err) {
-              logger.warn(`[bot] final flush reply chunk ${i + 1}/${chunks.length} failed for ${sessionKey}: ${err}`);
+              deliveryFailures++;
+              allChunksOk = false;
+              logger.error(`[bot] final flush reply chunk ${i + 1}/${chunks.length} failed for ${sessionKey} (chars=${chunks[i].length}): ${err}`);
             }
           }
-          logger.info(`[bot] Long response delivered to ${sessionKey} as ${chunks.length} chunks (${finalText.length} chars total)`);
+          // The final delivered chunk lives in lastEditText (not deliveredFinalized),
+          // so reconciliation can join them once without duplicating.
+          lastEditText = lastDeliveredChunk;
+          finalChunkSucceeded = allChunksOk;
+          logger.info(`[bot] Long response final-flush attempted for ${sessionKey}: ${chunks.length} chunks (${finalText.length} chars total), allOk=${allChunksOk}`);
         }
       }
 
-      // Safety fallback: if streaming didn't deliver real text, send full response via queue
-      if (response && response.trim() && !realTextDelivered) {
-        logger.warn(`[bot] Streaming delivery failed for ${sessionKey}, sending full response via queue`);
-        if (currentMsg) {
+      // ── Reconciliation: did the user actually receive the full response? ──
+      //
+      // The streaming code splits Claude's response on `\n\n` boundaries and sends
+      // each paragraph as its own Telegram message via editMessageText / ctx.reply.
+      // ANY of those calls can fail (Telegram 429, server-side flood, transient
+      // network error, malformed-text rejection) — and the old code only logged a
+      // warning, leaving the user with a partial or empty conversation.
+      //
+      // We compute a "delivered" set: the texts we successfully pushed to Telegram
+      // (from finalized previous messages + the final chunk). We then check whether
+      // they account for ~all of Claude's response. If not, we re-deliver the FULL
+      // response through notifyQueue, which has retries, fallback chats, persistent
+      // disk queue, and 429 backoff — the reliable path.
+      //
+      // Why measure "covered ratio" instead of exact match: streaming edits only
+      // store the LAST edit per Telegram message (lastEditText), so rapid mid-stream
+      // edits to the same message overwrite each other. We can't reconstruct a
+      // perfect transcript, but we can detect the failure mode where text is missing.
+      const responseTrimmed = (response ?? "").trim();
+      const allDelivered = (lastEditText ? [...deliveredFinalized, lastEditText] : deliveredFinalized).join("\n\n");
+      const deliveredChars = allDelivered.length;
+      const responseChars = responseTrimmed.length;
+      const coveredRatio = responseChars === 0 ? 1 : deliveredChars / responseChars;
+
+      // Heuristic: trigger fallback if (a) streaming was outright broken,
+      // (b) any individual delivery failed AND we have a real response,
+      // (c) we delivered less than 80% of the response chars,
+      // (d) the original "no text delivered" condition.
+      const shouldFallback =
+        responseTrimmed.length > 0 &&
+        (
+          streamingBroken ||
+          (!realTextDelivered) ||
+          (deliveryFailures > 0) ||
+          (!finalChunkSucceeded && currentMsgText.trim().length > 0) ||
+          coveredRatio < 0.8
+        );
+
+      if (shouldFallback) {
+        logger.error(
+          `[bot] Reconciliation FAILED for ${sessionKey}: ` +
+          `responseChars=${responseChars}, deliveredChars=${deliveredChars}, ` +
+          `coveredRatio=${coveredRatio.toFixed(2)}, deliveryFailures=${deliveryFailures}, ` +
+          `streamingBroken=${streamingBroken}, realTextDelivered=${realTextDelivered}, ` +
+          `finalChunkSucceeded=${finalChunkSucceeded} — re-delivering via notifyQueue`
+        );
+
+        // Tear down any orphaned placeholder if streaming never delivered real text.
+        if (currentMsg && !realTextDelivered) {
           await ctx.api.deleteMessage(currentMsg.chat.id, currentMsg.message_id).catch(() => {});
         }
+
+        // Send the FULL response via the persistent queue. notifyQueue handles
+        // chunking (4096 limit), 429 backoff, retries, and fallback-chat routing.
+        // We tag with "reconcile:" so logs make the cause clear.
+        const tag = streamingBroken
+          ? `reconcile-broken:${sessionKey}`
+          : (!realTextDelivered ? `reconcile-empty:${sessionKey}` : `reconcile-partial:${sessionKey}`);
         await notifyQueue.send({
           chatId: primaryChatId,
           threadId,
-          text: response,
+          text: responseTrimmed,
           fallbackChatId,
           fallbackThreadId,
           replyToMessageId: batch[0].msgId,
-          tag: `fallback:${sessionKey}`,
+          tag,
         });
+      } else if (responseTrimmed.length > 0) {
+        // Happy path — log a confirmation so we have an audit trail.
+        logger.info(
+          `[bot] Delivered ${sessionKey} OK: responseChars=${responseChars}, ` +
+          `deliveredChars=${deliveredChars}, coveredRatio=${coveredRatio.toFixed(2)}, ` +
+          `failures=${deliveryFailures}`
+        );
       }
       clearInflight(sessionKey);
     } catch (err) {
@@ -944,6 +1112,17 @@ export function createBot(
       replyContext,
     };
 
+    // Wrap processBatch so an unhandled throw inside it can't take down the bot.
+    // Any uncaught error here would surface as an unhandledRejection that may
+    // crash the process; we'd rather log it and keep serving other sessions.
+    const safeProcessBatch = (key: string, messages: PendingMessage[]) => {
+      processBatch(key, messages).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        const stack = err instanceof Error ? err.stack : "";
+        logger.error(`[bot] UNHANDLED error in processBatch for ${key}: ${msg}${stack ? `\n${stack}` : ""}`);
+      });
+    };
+
     const existing = sessionBuffers.get(sessionKey);
     if (existing) {
       // Add to existing buffer and reset timer
@@ -954,7 +1133,7 @@ export function createBot(
         const buf = sessionBuffers.get(sessionKey);
         if (buf) {
           sessionBuffers.delete(sessionKey);
-          processBatch(sessionKey, buf.messages);
+          safeProcessBatch(sessionKey, buf.messages);
         }
       }, MESSAGE_BATCH_DELAY_MS);
     } else {
@@ -963,7 +1142,7 @@ export function createBot(
         const buf = sessionBuffers.get(sessionKey);
         if (buf) {
           sessionBuffers.delete(sessionKey);
-          processBatch(sessionKey, buf.messages);
+          safeProcessBatch(sessionKey, buf.messages);
         }
       }, MESSAGE_BATCH_DELAY_MS);
       sessionBuffers.set(sessionKey, { messages: [pending], timer });

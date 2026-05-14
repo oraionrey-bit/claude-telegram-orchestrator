@@ -478,6 +478,27 @@ export class SessionManager {
     this.logger.info(`Killed all ${keys.length} sessions`);
   }
 
+  /**
+   * True iff any live session has a Claude response in flight (responseResolve set).
+   * Used by the SIGTERM shutdown handler to wait for pending responses before
+   * killing sessions — without this, long Claude responses get lost mid-generation
+   * when SIGTERM hits and never reach the user.
+   */
+  hasInflightResponses(): boolean {
+    for (const session of this.sessions.values()) {
+      if (session.responseResolve !== null) return true;
+    }
+    return false;
+  }
+
+  inflightCount(): number {
+    let n = 0;
+    for (const session of this.sessions.values()) {
+      if (session.responseResolve !== null) n++;
+    }
+    return n;
+  }
+
   getStatus(): Array<{
     key: string;
     alive: boolean;

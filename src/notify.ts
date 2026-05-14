@@ -80,13 +80,17 @@ export class NotificationQueue {
     tag?: string;
     maxAttempts?: number;
   }): Promise<boolean> {
+    const tag = opts.tag ?? "none";
+    const chars = opts.text.length;
+    const chunkCount = chunkMessage(opts.text).length;
+
     // Check if primary chat is banned
     if (this.isChatBanned(opts.chatId)) {
       // Try fallback immediately if available
       if (opts.fallbackChatId && !this.isChatBanned(opts.fallbackChatId)) {
         const sent = await this.trySend(opts.fallbackChatId, opts.fallbackThreadId, opts.text);
         if (sent) {
-          this.logger.info(`[notify] Primary chat ${opts.chatId} banned, sent via fallback`);
+          this.logger.info(`[notify] OK via fallback (tag=${tag}, chat=${opts.fallbackChatId}, chars=${chars}, chunks=${chunkCount}) — primary ${opts.chatId} banned`);
           return true;
         }
       }
@@ -95,20 +99,35 @@ export class NotificationQueue {
       return false;
     }
 
-    // Try immediate send
+    // Try immediate send. First with reply_to; if Telegram rejects (e.g. "message to be replied not found"),
+    // retry without reply_to so the user still gets the response.
     const sent = await this.trySend(opts.chatId, opts.threadId, opts.text, opts.replyToMessageId);
-    if (sent) return true;
+    if (sent) {
+      this.logger.info(`[notify] OK (tag=${tag}, chat=${opts.chatId}, chars=${chars}, chunks=${chunkCount}, reply=${opts.replyToMessageId ?? "none"})`);
+      return true;
+    }
+
+    // Retry without reply_to_message_id — Telegram often rejects replies to old/deleted messages,
+    // but accepts the same content without the reply hint.
+    if (opts.replyToMessageId) {
+      const retrySent = await this.trySend(opts.chatId, opts.threadId, opts.text);
+      if (retrySent) {
+        this.logger.info(`[notify] OK retry-no-reply (tag=${tag}, chat=${opts.chatId}, chars=${chars}, chunks=${chunkCount}) — original reply-to ${opts.replyToMessageId} rejected`);
+        return true;
+      }
+    }
 
     // Try fallback
     if (opts.fallbackChatId && !this.isChatBanned(opts.fallbackChatId)) {
       const fallbackSent = await this.trySend(opts.fallbackChatId, opts.fallbackThreadId, opts.text);
       if (fallbackSent) {
-        this.logger.info(`[notify] Primary failed, sent via fallback (tag=${opts.tag ?? "none"})`);
+        this.logger.info(`[notify] OK via fallback (tag=${tag}, chat=${opts.fallbackChatId}, chars=${chars}, chunks=${chunkCount}) — primary failed`);
         return true;
       }
     }
 
     // Queue for retry
+    this.logger.error(`[notify] All immediate attempts FAILED (tag=${tag}, chat=${opts.chatId}, chars=${chars}, chunks=${chunkCount}) — queueing for retry`);
     this.enqueue(opts);
     return false;
   }
@@ -176,27 +195,32 @@ export class NotificationQueue {
     }
 
     const chunks = chunkMessage(text);
-    try {
-      for (let i = 0; i < chunks.length; i++) {
-        const opts: Record<string, unknown> = {};
-        if (threadId !== undefined) opts.message_thread_id = threadId;
-        if (i === 0 && replyToMessageId) opts.reply_to_message_id = replyToMessageId;
-        await this.api.sendMessage(chatId, chunks[i], opts);
+    for (let i = 0; i < chunks.length; i++) {
+      const opts: Record<string, unknown> = {};
+      if (threadId !== undefined) opts.message_thread_id = threadId;
+      if (i === 0 && replyToMessageId) opts.reply_to_message_id = replyToMessageId;
+      try {
+        const sent = await this.api.sendMessage(chatId, chunks[i], opts);
+        this.logger.debug(`[notify] chunk ${i + 1}/${chunks.length} sent to chat ${chatId} (msg_id=${sent.message_id}, chars=${chunks[i].length})`);
+      } catch (err: unknown) {
+        // Parse 429 retry_after and track ban
+        const errStr = String(err);
+        const retryMatch = errStr.match(/retry after (\d+)/i);
+        if (retryMatch) {
+          const retryAfterSec = parseInt(retryMatch[1]);
+          const banExpiry = Date.now() + retryAfterSec * 1000;
+          this.chatBans.set(chatId, banExpiry);
+          this.logger.warn(`[notify] Chat ${chatId} banned until ${new Date(banExpiry).toISOString()} (${retryAfterSec}s)`);
+        }
+        this.logger.warn(`[notify] Send failed to chat ${chatId} chunk ${i + 1}/${chunks.length} (chars=${chunks[i].length}, reply=${opts.reply_to_message_id ?? "none"}): ${err}`);
+        return false;
       }
-      return true;
-    } catch (err: unknown) {
-      // Parse 429 retry_after and track ban
-      const errStr = String(err);
-      const retryMatch = errStr.match(/retry after (\d+)/i);
-      if (retryMatch) {
-        const retryAfterSec = parseInt(retryMatch[1]);
-        const banExpiry = Date.now() + retryAfterSec * 1000;
-        this.chatBans.set(chatId, banExpiry);
-        this.logger.warn(`[notify] Chat ${chatId} banned until ${new Date(banExpiry).toISOString()} (${retryAfterSec}s)`);
+      // Pace multi-chunk sends to avoid per-chat rate limits (1 msg/sec/chat).
+      if (i < chunks.length - 1) {
+        await new Promise((r) => setTimeout(r, 1100));
       }
-      this.logger.warn(`[notify] Send failed to chat ${chatId}: ${err}`);
-      return false;
     }
+    return true;
   }
 
   private async processQueue(): Promise<void> {

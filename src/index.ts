@@ -86,7 +86,8 @@ async function startOrchestrator(): Promise<void> {
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down...`);
-    notifyQueue.stop();
+    // Stop accepting NEW work first (scheduler triggers, http requests, telegram polling).
+    // notifyQueue stays running so completed in-flight responses can drain to Telegram.
     scheduler.stop();
     httpServer.stop();
     try {
@@ -94,6 +95,38 @@ async function startOrchestrator(): Promise<void> {
     } catch {
       // Already stopped
     }
+
+    // Drain in-flight Claude responses before killing sessions. Without this,
+    // long responses (e.g. multi-thousand-char generations) that are mid-flight
+    // when SIGTERM arrives get killed and lost — the user sees nothing despite
+    // Claude having generated a complete response.
+    //
+    // The "completion-only" delivery path only calls notifyQueue.send() AFTER
+    // the full response is back. If we kill the Claude subprocess before that
+    // happens, the response never reaches the persistent notify queue and is
+    // gone forever (recovery re-sends the user's message but Claude generates a
+    // different, often shorter, response next time).
+    const drainStart = Date.now();
+    const drainTimeoutMs = 60_000;
+    let inflightAtStart = sessionManager.inflightCount();
+    if (inflightAtStart > 0) {
+      logger.info(`[shutdown] Draining ${inflightAtStart} in-flight Claude response(s) (timeout ${drainTimeoutMs}ms)...`);
+    }
+    while (sessionManager.hasInflightResponses() && Date.now() - drainStart < drainTimeoutMs) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    const drainElapsed = Date.now() - drainStart;
+    if (sessionManager.hasInflightResponses()) {
+      logger.warn(`[shutdown] Drain TIMEOUT after ${drainElapsed}ms — ${sessionManager.inflightCount()} response(s) still in flight, will be killed`);
+    } else if (inflightAtStart > 0) {
+      logger.info(`[shutdown] All ${inflightAtStart} in-flight response(s) drained in ${drainElapsed}ms`);
+    }
+
+    // Give notifyQueue a couple seconds to flush any responses that just
+    // completed during the drain (notify.trySend is async).
+    await new Promise((r) => setTimeout(r, 2000));
+    notifyQueue.stop();
+
     await sessionManager.killAll();
 
     // Remove PID file
@@ -110,6 +143,23 @@ async function startOrchestrator(): Promise<void> {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  // Last-resort safety nets — log and KEEP RUNNING. A single bad message
+  // (e.g. unhandled rejection inside processBatch, malformed Telegram update)
+  // must never silently kill the orchestrator and drop the user's response.
+  process.on("unhandledRejection", (reason, promise) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : "";
+    logger.error(`[fatal-shield] unhandledRejection: ${msg}${stack ? `\n${stack}` : ""}`);
+    // Do NOT exit — we want to stay up so the next message still gets delivered.
+  });
+  process.on("uncaughtException", (err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : "";
+    logger.error(`[fatal-shield] uncaughtException: ${msg}${stack ? `\n${stack}` : ""}`);
+    // Do NOT exit — same reason. If state is truly hosed, the next request
+    // will fail loudly with a visible error and launchd will restart us.
+  });
 
   // Start the bot with retry logic for 409 conflicts
   logger.info("Bot starting...");
