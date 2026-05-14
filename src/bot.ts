@@ -111,6 +111,53 @@ export function setScheduler(scheduler: Scheduler): void {
   _scheduler = scheduler;
 }
 
+/**
+ * Render a 5-field cron expression as a short human-readable string for
+ * /schedules output. Falls back to the raw cron if the pattern is exotic.
+ * Examples:
+ *   "0 8 * * *"       → "daily at 8:00am"
+ *   "33 13 * * 1,3"   → "Mon, Wed at 1:33pm"
+ *   "0 15 * * 1-5"    → "weekdays at 3:00pm"
+ */
+function humanizeCron(cron: string): string {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== 5) return cron;
+  const [minF, hourF, domF, monthF, dowF] = fields;
+
+  // Only humanize the common case: specific minute + specific hour
+  if (
+    !/^\d+$/.test(minF) ||
+    !/^\d+$/.test(hourF) ||
+    domF !== "*" ||
+    monthF !== "*"
+  ) {
+    return cron;
+  }
+
+  const minute = parseInt(minF, 10);
+  const hour24 = parseInt(hourF, 10);
+  const ampm = hour24 >= 12 ? "pm" : "am";
+  const hour12 = ((hour24 + 11) % 12) + 1;
+  const time = `${hour12}:${minute.toString().padStart(2, "0")}${ampm}`;
+
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  let when: string;
+  if (dowF === "*") {
+    when = "daily";
+  } else if (dowF === "1-5") {
+    when = "weekdays";
+  } else if (dowF === "0,6" || dowF === "6,0") {
+    when = "weekends";
+  } else if (/^[0-6](,[0-6])*$/.test(dowF)) {
+    const list = dowF.split(",").map((d) => days[parseInt(d, 10)]);
+    when = list.join(", ");
+  } else {
+    return cron;
+  }
+
+  return `${when} at ${time}`;
+}
+
 // ── Message batching: buffer rapid messages per session ──
 interface PendingMessage {
   ctx: Context;
@@ -1037,22 +1084,41 @@ async function handleOrchestratorCommand(
 
     case "/schedules": {
       const userId = ctx.from?.id;
-      if (!userId || !ADMIN_USERS.includes(userId)) {
-        await ctx.reply("Only admins can manage schedules.", replyOpts);
+      if (!userId) {
+        await ctx.reply("Cannot determine your user ID.", replyOpts);
         return true;
       }
       if (!_scheduler) {
         await ctx.reply("Scheduler not initialized.", replyOpts);
         return true;
       }
-      const jobs = _scheduler.listJobs();
+      const isAdmin = ADMIN_USERS.includes(userId);
+      const allJobs = _scheduler.listJobs();
+
+      // Non-admins only see jobs targeting the chat they're currently in.
+      // Admins see everything.
+      const jobs = isAdmin
+        ? allJobs
+        : allJobs.filter((j) => j.chatId === ctx.chat?.id);
+
       if (jobs.length === 0) {
-        await ctx.reply("No scheduled jobs.", replyOpts);
-      } else {
-        const lines = jobs.map(j =>
-          `${j.enabled ? "✅" : "⏸️"} ${j.name} (${j.id})\n   Cron: ${j.cron}\n   Chat: ${j.chatId}${j.topicId ? ` topic ${j.topicId}` : ""}\n   Next: ${j.nextRun ?? "—"}`
+        await ctx.reply(
+          isAdmin ? "No scheduled jobs." : "No scheduled jobs for this chat.",
+          replyOpts
         );
-        await ctx.reply(lines.join("\n\n"), replyOpts);
+      } else {
+        const lines = jobs.map((j) => {
+          const human = humanizeCron(j.cron);
+          const preview = j.prompt
+            ? `📝 briefing: ${j.prompt.slice(0, 80)}${j.prompt.length > 80 ? "…" : ""}`
+            : `💬 ${j.message.slice(0, 80).replace(/\n/g, " ")}${j.message.length > 80 ? "…" : ""}`;
+          const adminExtras = isAdmin ? `\n   Chat: ${j.chatId}${j.topicId ? ` topic ${j.topicId}` : ""}` : "";
+          return `${j.enabled ? "✅" : "⏸️"} ${j.name} (${j.id})\n   When: ${human}${adminExtras}\n   ${preview}\n   Next: ${j.nextRun ?? "—"}`;
+        });
+        const header = isAdmin
+          ? `All scheduled jobs (${jobs.length}):`
+          : `Your scheduled jobs (${jobs.length}):`;
+        await ctx.reply(`${header}\n\n${lines.join("\n\n")}`, replyOpts);
       }
       return true;
     }
@@ -1196,8 +1262,8 @@ async function handleOrchestratorCommand(
         "  /model <name> — Switch model (opus/sonnet/haiku)",
         "  /mode <streaming|completion> — Switch response mode",
         "  /sessions — Show all active sessions",
-        "  /schedules — List scheduled messages",
-        "  /schedule add|add-brief|remove|toggle|reload — Manage schedules",
+        "  /schedules — List your scheduled messages (admins see all)",
+        "  /schedule add|add-brief|remove|toggle|reload — Manage schedules (admin)",
         "  /help — This message",
         "",
         "Claude commands (forwarded to Claude Code):",
