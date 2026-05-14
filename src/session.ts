@@ -1,43 +1,39 @@
-// ── Session manager: Claude Code process lifecycle ──
+// ── Session manager: per-session backend lifecycle ──
+//
+// SessionManager is a thin orchestration layer. It owns one SessionBackend per
+// session key and delegates all the actual driving (spawn, send, kill) to that
+// backend. The backend choice (PipeBackend vs TmuxBackend) is per-session and
+// comes from the user-config layer.
+//
+// History: this file used to contain the entire pipe-backend implementation
+// inline (stream-json reader, stdin writer, event dispatch, etc.). All of that
+// moved to src/backends/pipe.ts as part of introducing the SessionBackend
+// abstraction. The TmuxBackend (src/backends/tmux.ts) is the new alternative
+// that drives interactive `claude` (no -p) inside a detached tmux session — a
+// hedge against `--print` being deprecated.
 
 import { join } from "path";
-import { mkdirSync, existsSync } from "fs";
-import { homedir } from "os";
-import { getConfigDir, loadConfig } from "./config";
-import {
-  ensureSessionDir,
-  loadSessionMeta,
-  saveSessionMeta,
-} from "./memory";
+import { mkdirSync } from "fs";
+import { getConfigDir } from "./config";
+import { ensureSessionDir, loadSessionMeta } from "./memory";
 import { Logger } from "./utils";
-import type { ClaudeStreamEvent, ContentBlock, OrchestratorConfig, SessionInfo } from "./types";
+import type { ContentBlock, OrchestratorConfig } from "./types";
+import type {
+  SessionBackend,
+  OnDeltaCallback,
+  OnToolUseCallback,
+  OnToolCompleteCallback,
+} from "./backends/types";
+import { PipeBackend } from "./backends/pipe";
+import { TmuxBackend } from "./backends/tmux";
+import { getSessionBackend } from "./user-config";
 
 const LOGS_DIR = join(getConfigDir(), "logs", "sessions");
 
-// Callback fired on each streaming delta
-export type OnDeltaCallback = (accumulatedText: string) => void;
-
-// Callback fired when Claude invokes a tool (for progress display)
-export type OnToolUseCallback = (toolName: string, description: string) => void;
-
-// Callback fired when a tool completes (tool_result event or next assistant turn)
-export type OnToolCompleteCallback = (toolName: string, durationMs: number) => void;
-
-// Extended session info with stdout reader state
-interface LiveSession extends SessionInfo {
-  stdoutBuffer: string;
-  responseResolve: ((text: string) => void) | null;
-  responseText: string;
-  readerActive: boolean;
-  onDelta: OnDeltaCallback | null;
-  onToolUse: OnToolUseCallback | null;
-  onToolComplete: OnToolCompleteCallback | null;
-  lastToolName: string | null;
-  lastToolStartTime: number | null;
-}
+export type { OnDeltaCallback, OnToolUseCallback, OnToolCompleteCallback };
 
 export class SessionManager {
-  private sessions = new Map<string, LiveSession>();
+  private sessions = new Map<string, SessionBackend>();
   private sessionModelOverrides = new Map<string, string>();
   private config: OrchestratorConfig;
   private logger: Logger;
@@ -73,26 +69,29 @@ export class SessionManager {
   /**
    * Send a message to a Claude session. Creates the session if needed.
    * Returns the assistant's full text response.
-   * If onDelta is provided, it's called with the accumulated text on each streaming chunk.
    */
-  async sendMessage(sessionKey: string, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback, onToolComplete?: OnToolCompleteCallback): Promise<string> {
-    let session = this.sessions.get(sessionKey);
+  async sendMessage(
+    sessionKey: string,
+    content: ContentBlock[],
+    onDelta?: OnDeltaCallback,
+    onToolUse?: OnToolUseCallback,
+    onToolComplete?: OnToolCompleteCallback,
+  ): Promise<string> {
+    let backend = this.sessions.get(sessionKey);
 
-    if (!session || !session.proc || session.proc.exitCode !== null) {
-      session = await this.spawnSession(sessionKey);
+    if (!backend || !backend.isAlive()) {
+      backend = await this.spawnBackend(sessionKey);
     }
 
-    session.lastActivity = Date.now();
-    session.messageCount++;
-
-    return this.writeAndWait(session, content, onDelta, onToolUse, onToolComplete);
+    backend.touch();
+    return backend.sendMessage(content, { onDelta, onToolUse, onToolComplete });
   }
 
   /**
-   * Spawn a new Claude Code process for the given session key.
+   * Spawn a backend (pipe or tmux) for the given session key, choosing based
+   * on per-user config.
    */
-  private async spawnSession(sessionKey: string): Promise<LiveSession> {
-    // Evict if at capacity
+  private async spawnBackend(sessionKey: string): Promise<SessionBackend> {
     if (this.sessions.size >= this.config.maxSessions) {
       this.evictLRU();
     }
@@ -100,339 +99,44 @@ export class SessionManager {
     const workDir = ensureSessionDir(sessionKey);
     const meta = loadSessionMeta(sessionKey);
     const previousSessionId = meta?.sessionId as string | undefined;
-    const sessionLogPath = join(LOGS_DIR, `${sessionKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`);
-
     const model = this.sessionModelOverrides.get(sessionKey) ?? this.config.defaultModel;
-    const args: string[] = [
-      "claude",
-      "--print",
-      "--verbose",
-      "--input-format", "stream-json",
-      "--output-format", "stream-json",
-      "--include-partial-messages",
-      "--permission-mode", "bypassPermissions",
-      "--model", model,
-    ];
-    this.logger.info(`[session:${sessionKey}] Using model: ${model}`);
+    const backendKind = getSessionBackend(sessionKey);
 
-    // Pass MCP config so sessions get olog and other MCP tools
-    const mcpConfig = join(process.env.HOME || homedir(), ".claude", "mcp_servers.json");
-    if (existsSync(mcpConfig)) {
-      args.push("--mcp-config", mcpConfig);
+    this.logger.info(`[session:${sessionKey}] Spawning ${backendKind} backend (model=${model}, workdir=${workDir})`);
+
+    let backend: SessionBackend;
+    if (backendKind === "tmux") {
+      backend = new TmuxBackend(sessionKey, {
+        workdir: workDir,
+        model,
+        previousSessionId,
+        logger: this.logger,
+      });
+    } else {
+      backend = new PipeBackend(sessionKey, {
+        workdir: workDir,
+        model,
+        previousSessionId,
+        logger: this.logger,
+      });
     }
 
-    if (previousSessionId) {
-      args.push("--resume", previousSessionId);
-      this.logger.info(`[session:${sessionKey}] Resuming session ${previousSessionId}`);
-    }
-
-    this.logger.info(`[session:${sessionKey}] Spawning Claude Code in ${workDir}`);
-
-    const proc = Bun.spawn(args, {
-      cwd: workDir,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
+    await backend.spawn({
+      workdir: workDir,
+      model,
+      previousSessionId,
+      logger: this.logger,
     });
 
-    // Pipe stderr to log file
-    this.pipeStderr(proc, sessionKey, sessionLogPath);
-
-    const session: LiveSession = {
-      key: sessionKey,
-      proc,
-      sessionId: previousSessionId ?? null,
-      lastActivity: Date.now(),
-      messageCount: 0,
-      workDir,
-      stdoutBuffer: "",
-      responseResolve: null,
-      responseText: "",
-      readerActive: false,
-      onDelta: null,
-      onToolUse: null,
-      onToolComplete: null,
-      lastToolName: null,
-      lastToolStartTime: null,
-    };
-
-    this.sessions.set(sessionKey, session);
-
-    // Start persistent stdout reader
-    this.startStdoutReader(session);
-
-    return session;
-  }
-
-  /**
-   * Start a background reader that continuously reads stdout and dispatches
-   * parsed events. This reader lives for the lifetime of the process.
-   */
-  private async startStdoutReader(session: LiveSession): Promise<void> {
-    const proc = session.proc;
-    if (!proc?.stdout || typeof proc.stdout === "number") return;
-    if (session.readerActive) return;
-
-    session.readerActive = true;
-    const stdout = proc.stdout as ReadableStream<Uint8Array>;
-    const reader = stdout.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        session.stdoutBuffer += decoder.decode(value, { stream: true });
-
-        // Process complete lines
-        const lines = session.stdoutBuffer.split("\n");
-        session.stdoutBuffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-
-          try {
-            const event = JSON.parse(trimmed) as ClaudeStreamEvent;
-            this.handleEvent(session, event);
-          } catch {
-            this.logger.debug(`[session:${session.key}] Non-JSON: ${trimmed.slice(0, 120)}`);
-          }
-        }
-      }
-    } catch (err) {
-      this.logger.warn(`[session:${session.key}] Stdout reader error: ${err}`);
-    } finally {
-      session.readerActive = false;
-      reader.releaseLock();
-      this.logger.info(`[session:${session.key}] Stdout reader ended`);
-
-      // If there's a pending response, resolve it with what we have
-      if (session.responseResolve) {
-        session.responseResolve(session.responseText || "(session ended)");
-        session.responseResolve = null;
-        session.responseText = "";
-      }
-    }
-  }
-
-  /**
-   * Handle a single parsed event from Claude's stream-json output.
-   */
-  private handleEvent(session: LiveSession, event: ClaudeStreamEvent): void {
-    // Capture session_id (it's top-level on result and assistant events)
-    if (event.session_id) {
-      session.sessionId = event.session_id;
-      saveSessionMeta(session.key, { sessionId: session.sessionId });
-    }
-
-    // Content block deltas (streaming text) — append incrementally
-    if (event.type === "content_block_delta" && event.delta?.text) {
-      // If a tool was running, it just completed (text output means we're back)
-      this.fireToolComplete(session);
-      session.responseText += event.delta.text;
-      if (session.onDelta) {
-        session.onDelta(session.responseText);
-      }
-    }
-
-    // Full assistant message — use as authoritative text (replaces delta accumulation).
-    // This arrives after all content_block_delta events for a turn, so it contains
-    // the complete text. We REPLACE rather than append to avoid duplication.
-    // NOTE: Do NOT call onDelta again here — the deltas already delivered this text
-    // incrementally. Calling onDelta again with the same accumulated text caused
-    // duplicate messages in Telegram.
-    if (event.type === "assistant" && event.message?.content) {
-      // If a tool was running, it completed before this assistant turn
-      this.fireToolComplete(session);
-      let fullText = "";
-      for (const block of event.message.content) {
-        if (block.type === "text" && block.text) {
-          fullText += block.text;
-        }
-        // Detect tool use and fire progress callback
-        if (block.type === "tool_use" && block.name && session.onToolUse) {
-          const input = block.input as Record<string, unknown> | undefined;
-          let desc = "";
-          switch (block.name) {
-            case "Bash":
-              desc = (input?.description as string) || (input?.command as string)?.slice(0, 80) || "Running command";
-              break;
-            case "Read":
-              desc = (input?.file_path as string)?.split("/").slice(-2).join("/") || "Reading file";
-              break;
-            case "Edit":
-              desc = (input?.file_path as string)?.split("/").slice(-2).join("/") || "Editing file";
-              break;
-            case "Write":
-              desc = (input?.file_path as string)?.split("/").slice(-2).join("/") || "Writing file";
-              break;
-            case "Grep":
-              desc = `"${(input?.pattern as string)?.slice(0, 40) || "..."}"`;
-              break;
-            case "Glob":
-              desc = (input?.pattern as string) || "Searching files";
-              break;
-            case "WebSearch":
-              desc = (input?.query as string)?.slice(0, 60) || "Searching web";
-              break;
-            case "WebFetch":
-              desc = (input?.url as string)?.slice(0, 60) || "Fetching URL";
-              break;
-            case "Agent":
-              desc = (input?.description as string) || "Running sub-agent";
-              break;
-            default:
-              desc = block.name;
-          }
-          session.onToolUse(block.name, desc);
-          session.lastToolName = block.name;
-          session.lastToolStartTime = Date.now();
-        }
-      }
-      if (fullText) {
-        session.responseText = fullText;
-      }
-    }
-
-    // Result = turn complete. Resolve the pending promise.
-    if (event.type === "result") {
-      this.fireToolComplete(session);
-      if (session.responseResolve) {
-        // Prefer accumulated text from assistant events, fall back to result field
-        const text = session.responseText || event.result || "(no response)";
-        this.logger.info(`[session:${session.key}] Response ready (${text.length} chars)`);
-        session.responseResolve(text);
-        session.responseResolve = null;
-        session.responseText = "";
-        session.onDelta = null;
-        session.onToolUse = null;
-        session.onToolComplete = null;
-        session.lastToolName = null;
-        session.lastToolStartTime = null;
-      }
-    }
-  }
-
-  private fireToolComplete(session: LiveSession): void {
-    if (session.lastToolName && session.lastToolStartTime && session.onToolComplete) {
-      const durationMs = Date.now() - session.lastToolStartTime;
-      session.onToolComplete(session.lastToolName, durationMs);
-    }
-    session.lastToolName = null;
-    session.lastToolStartTime = null;
-  }
-
-  /**
-   * Write a user message to stdin and wait for the response via the background reader.
-   */
-  private writeAndWait(session: LiveSession, content: ContentBlock[], onDelta?: OnDeltaCallback, onToolUse?: OnToolUseCallback, onToolComplete?: OnToolCompleteCallback): Promise<string> {
-    const proc = session.proc;
-    if (!proc?.stdin || typeof proc.stdin === "number") {
-      return Promise.resolve("(session has no stdin)");
-    }
-
-    // Reset response accumulator and set callbacks
-    session.responseText = "";
-    session.lastToolName = null;
-    session.lastToolStartTime = null;
-
-    // Idle-timeout watchdog: reset on every delta / tool event so long-running
-    // tool calls (deploys, builds) don't kill the session as long as it's producing output.
-    const IDLE_TIMEOUT_MS = 5 * 60 * 1000;   // 5 min with no activity = dead
-    const TOTAL_TIMEOUT_MS = 30 * 60 * 1000; // 30 min absolute cap
-    let lastActivity = Date.now();
-    const startedAt = Date.now();
-    const bump = () => { lastActivity = Date.now(); };
-
-    session.onDelta = onDelta ? (text: string) => { bump(); onDelta(text); } : (() => bump());
-    session.onToolUse = onToolUse ? (name: string, desc: string) => { bump(); onToolUse(name, desc); } : (() => bump());
-    session.onToolComplete = onToolComplete ? (name: string, ms: number) => { bump(); onToolComplete(name, ms); } : (() => bump());
-
-    // Build stream-json input (requires message wrapper with role)
-    const input = JSON.stringify({
-      type: "user",
-      message: {
-        role: "user",
-        content,
-      },
-    }) + "\n";
-
-    // Write to stdin
-    const stdin = proc.stdin as import("bun").FileSink;
-    stdin.write(input);
-    stdin.flush();
-
-    // Return a promise that resolves when the background reader sees a "result" event
-    return new Promise<string>((resolve) => {
-      session.responseResolve = resolve;
-
-      const checkInterval = setInterval(() => {
-        // Self-clear when the success path nulls responseResolve before resolving
-        if (session.responseResolve !== resolve) {
-          clearInterval(checkInterval);
-          return;
-        }
-        const idle = Date.now() - lastActivity;
-        const total = Date.now() - startedAt;
-        if (idle > IDLE_TIMEOUT_MS || total > TOTAL_TIMEOUT_MS) {
-          const reason = idle > IDLE_TIMEOUT_MS
-            ? `idle ${Math.round(idle / 1000)}s`
-            : `total ${Math.round(total / 60_000)}min`;
-          this.logger.warn(`[session:${session.key}] Response timeout (${reason})`);
-          clearInterval(checkInterval);
-          session.responseResolve = null;
-          const partial = session.responseText;
-          session.responseText = "";
-          session.onDelta = null;
-          session.onToolUse = null;
-          session.onToolComplete = null;
-          session.lastToolName = null;
-          session.lastToolStartTime = null;
-          resolve(partial || "(response timed out — no partial text available)");
-        }
-      }, 30_000);
-    });
-  }
-
-  /**
-   * Pipe stderr to a log file in the background.
-   */
-  private async pipeStderr(
-    proc: ReturnType<typeof Bun.spawn>,
-    sessionKey: string,
-    logPath: string
-  ): Promise<void> {
-    if (!proc.stderr || typeof proc.stderr === "number") return;
-
-    const file = Bun.file(logPath);
-    const writer = file.writer();
-    const stderr = proc.stderr as ReadableStream<Uint8Array>;
-    const reader = stderr.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const text = decoder.decode(value, { stream: true });
-        writer.write(text);
-        writer.flush();
-      }
-    } catch {
-      // Process died
-    } finally {
-      reader.releaseLock();
-      writer.end();
-    }
+    this.sessions.set(sessionKey, backend);
+    return backend;
   }
 
   private evictIdleSessions(): void {
     const timeoutMs = this.config.idleTimeoutMinutes * 60 * 1000;
     const now = Date.now();
-    for (const [key, session] of this.sessions) {
-      if (now - session.lastActivity > timeoutMs) {
+    for (const [key, backend] of this.sessions) {
+      if (now - backend.getLastActivity() > timeoutMs) {
         this.logger.info(`[session:${key}] Evicting idle session`);
         this.killSession(key);
       }
@@ -442,9 +146,10 @@ export class SessionManager {
   private evictLRU(): void {
     let oldestKey: string | null = null;
     let oldestTime = Infinity;
-    for (const [key, session] of this.sessions) {
-      if (session.lastActivity < oldestTime) {
-        oldestTime = session.lastActivity;
+    for (const [key, backend] of this.sessions) {
+      const t = backend.getLastActivity();
+      if (t < oldestTime) {
+        oldestTime = t;
         oldestKey = key;
       }
     }
@@ -455,16 +160,11 @@ export class SessionManager {
   }
 
   killSession(key: string): void {
-    const session = this.sessions.get(key);
-    if (!session) return;
-    if (session.proc?.exitCode === null) {
-      try { session.proc.kill(); } catch {}
-    }
-    // Resolve any pending response
-    if (session.responseResolve) {
-      session.responseResolve(session.responseText || "(session killed)");
-      session.responseResolve = null;
-    }
+    const backend = this.sessions.get(key);
+    if (!backend) return;
+    backend.kill().catch((err) => {
+      this.logger.warn(`[session:${key}] kill error: ${err}`);
+    });
     this.sessions.delete(key);
     this.logger.info(`[session:${key}] Killed`);
   }
@@ -479,22 +179,20 @@ export class SessionManager {
   }
 
   /**
-   * True iff any live session has a Claude response in flight (responseResolve set).
-   * Used by the SIGTERM shutdown handler to wait for pending responses before
-   * killing sessions — without this, long Claude responses get lost mid-generation
-   * when SIGTERM hits and never reach the user.
+   * True iff any live session has a Claude response in flight.
+   * Used by the SIGTERM shutdown handler to drain pending responses.
    */
   hasInflightResponses(): boolean {
-    for (const session of this.sessions.values()) {
-      if (session.responseResolve !== null) return true;
+    for (const backend of this.sessions.values()) {
+      if (backend.hasInflightResponses()) return true;
     }
     return false;
   }
 
   inflightCount(): number {
     let n = 0;
-    for (const session of this.sessions.values()) {
-      if (session.responseResolve !== null) n++;
+    for (const backend of this.sessions.values()) {
+      n += backend.inflightCount();
     }
     return n;
   }
@@ -506,15 +204,17 @@ export class SessionManager {
     lastActivity: string;
     messageCount: number;
     idleMinutes: number;
+    backend: "pipe" | "tmux";
   }> {
     const now = Date.now();
-    return [...this.sessions.entries()].map(([key, s]) => ({
+    return [...this.sessions.entries()].map(([key, backend]) => ({
       key,
-      alive: s.proc !== null && s.proc.exitCode === null,
-      sessionId: s.sessionId,
-      lastActivity: new Date(s.lastActivity).toISOString(),
-      messageCount: s.messageCount,
-      idleMinutes: Math.round((now - s.lastActivity) / 60000),
+      alive: backend.isAlive(),
+      sessionId: backend.getSessionId(),
+      lastActivity: new Date(backend.getLastActivity()).toISOString(),
+      messageCount: backend.getMessageCount(),
+      idleMinutes: Math.round((now - backend.getLastActivity()) / 60000),
+      backend: backend.kind,
     }));
   }
 

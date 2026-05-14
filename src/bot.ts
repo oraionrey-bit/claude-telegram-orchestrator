@@ -12,7 +12,13 @@ import { chunkMessage, formatUserMessage, Logger } from "./utils";
 import { logInbound, logOutbound } from "./channel-log";
 import type { Scheduler } from "./scheduler";
 import type { NotificationQueue } from "./notify";
-import { getUserConfigForSession, setUserConfig } from "./user-config";
+import {
+  getUserConfigForSession,
+  setUserConfig,
+  getSessionConfig,
+  setSessionConfig,
+  type BackendKind,
+} from "./user-config";
 import { markInflight, clearInflight } from "./inflight";
 
 // Path to the pdf-read skill (text + OCR fallback). Used when pdfjs returns
@@ -1229,7 +1235,7 @@ async function handleOrchestratorCommand(
         await ctx.reply("No active sessions.", replyOpts);
       } else {
         const lines = status.map(
-          (s) => `• ${s.key} — ${s.alive ? "alive" : "dead"}, idle ${s.idleMinutes}m, ${s.messageCount} msgs`
+          (s) => `• ${s.key} [${s.backend}] — ${s.alive ? "alive" : "dead"}, idle ${s.idleMinutes}m, ${s.messageCount} msgs`
         );
         await ctx.reply(lines.join("\n"), replyOpts);
       }
@@ -1433,6 +1439,46 @@ async function handleOrchestratorCommand(
       return true;
     }
 
+    case "/backend": {
+      // Per-session backend choice: pipe (default) vs tmux (interactive Claude
+      // in a detached tmux session). Admin-only for now — this is experimental.
+      const userId = ctx.from?.id;
+      if (!userId || !ADMIN_USERS.includes(userId)) {
+        await ctx.reply("Only admins can switch backends.", replyOpts);
+        return true;
+      }
+      const arg = args[0]?.toLowerCase();
+      if (!arg) {
+        const cur = getSessionConfig(sessionKey);
+        await ctx.reply(
+          `Backend for ${sessionKey}: ${cur.backend}\n` +
+          `Usage: /backend pipe | /backend tmux`,
+          replyOpts
+        );
+        return true;
+      }
+      if (arg !== "pipe" && arg !== "tmux") {
+        await ctx.reply("Usage: /backend pipe | /backend tmux", replyOpts);
+        return true;
+      }
+      const target: BackendKind = arg;
+      const before = getSessionConfig(sessionKey).backend;
+      if (before === target) {
+        await ctx.reply(`Already on ${target}.`, replyOpts);
+        return true;
+      }
+      // Kill the existing backend so the next message respawns under the new
+      // kind. The Claude session ID is persisted in session metadata, so the
+      // new backend will resume the same conversation if possible.
+      sessionManager.killSession(sessionKey);
+      setSessionConfig(sessionKey, { backend: target });
+      await ctx.reply(
+        `Switched ${sessionKey} to ${target} backend. Next message will respawn under the new backend.`,
+        replyOpts
+      );
+      return true;
+    }
+
     case "/help": {
       const help = [
         "Orchestrator commands:",
@@ -1440,6 +1486,7 @@ async function handleOrchestratorCommand(
         "  /restart — Restart session (same as /kill)",
         "  /model <name> — Switch model (opus/sonnet/haiku)",
         "  /mode <streaming|completion> — Switch response mode",
+        "  /backend <pipe|tmux> — Switch session backend (admin)",
         "  /sessions — Show all active sessions",
         "  /schedules — List your scheduled messages (admins see all)",
         "  /schedule add|add-brief|remove|toggle|reload — Manage schedules (admin)",
