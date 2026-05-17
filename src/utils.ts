@@ -52,6 +52,21 @@ export function formatUserMessage(senderName: string, text: string): string {
 }
 
 /**
+ * True when `text` is a Claude Code slash command (starts with `/` after trim).
+ *
+ * Slash commands MUST be forwarded to Claude without the `[SenderName]: ` prefix
+ * — Claude Code's slash-command parser only fires when the user message starts
+ * with `/`. Any prefix (even a single space) breaks command dispatch.
+ *
+ * Note for group chats: this strips sender attribution from slash commands.
+ * Acceptable tradeoff — slash commands act on Claude's session state, not
+ * the chat history, so attribution doesn't matter for them.
+ */
+export function isSlashCommand(text: string): boolean {
+  return text.trim().startsWith("/");
+}
+
+/**
  * Logger that writes to both stderr and a log file.
  */
 export class Logger {

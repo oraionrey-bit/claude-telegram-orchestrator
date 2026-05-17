@@ -1,14 +1,15 @@
 // ── Grammy bot setup & message handlers ──
 
 import { Bot, GrammyError, type Context } from "grammy";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdir, writeFile, unlink } from "node:fs/promises";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ContentBlock, OrchestratorConfig, ScheduleJob } from "./types";
 import { SessionManager } from "./session";
 import { getSessionKey, parseSessionKey } from "./router";
-import { chunkMessage, formatUserMessage, Logger } from "./utils";
+import { chunkMessage, formatUserMessage, isSlashCommand, Logger } from "./utils";
 import { logInbound, logOutbound } from "./channel-log";
 import type { Scheduler } from "./scheduler";
 import type { NotificationQueue } from "./notify";
@@ -422,11 +423,21 @@ export function createBot(
 
     if (batch.length === 1) {
       const pending = batch[0];
-      const msgText = pending.replyContext
-        ? `${pending.replyContext}\n${pending.text || "(sent an attachment)"}`
-        : (pending.text || "(sent an attachment)");
-      const formattedMessage = formatUserMessage(pending.senderName, msgText);
-      allContentBlocks.push({ type: "text", text: formattedMessage });
+      // Slash commands must be forwarded raw — Claude Code's parser only fires
+      // when the user message starts with `/`. The handler flushes any pending
+      // batch before queueing a slash command, so they always arrive as a
+      // 1-message batch with no replyContext / no attachments.
+      if (isSlashCommand(pending.text)) {
+        const raw = pending.text.trim();
+        allContentBlocks.push({ type: "text", text: raw });
+        logger.info(`[bot] completion-only forwarding slash command un-prefixed for ${sessionKey}: ${raw.slice(0, 80)}`);
+      } else {
+        const msgText = pending.replyContext
+          ? `${pending.replyContext}\n${pending.text || "(sent an attachment)"}`
+          : (pending.text || "(sent an attachment)");
+        const formattedMessage = formatUserMessage(pending.senderName, msgText);
+        allContentBlocks.push({ type: "text", text: formattedMessage });
+      }
       logInbound(sessionKey, pending.senderName, pending.text);
     } else {
       const combinedText = batch
@@ -575,11 +586,21 @@ export function createBot(
       // Combine text from all messages into one formatted block
       if (batch.length === 1) {
         const pending = batch[0];
-        const msgText = pending.replyContext
-          ? `${pending.replyContext}\n${pending.text || "(sent an attachment)"}`
-          : (pending.text || "(sent an attachment)");
-        const formattedMessage = formatUserMessage(pending.senderName, msgText);
-        allContentBlocks.push({ type: "text", text: formattedMessage });
+        // Slash commands must be forwarded raw — Claude Code's parser only fires
+        // when the user message starts with `/`. The handler flushes any pending
+        // batch before queueing a slash command, so they always arrive as a
+        // 1-message batch with no replyContext / no attachments.
+        if (isSlashCommand(pending.text)) {
+          const raw = pending.text.trim();
+          allContentBlocks.push({ type: "text", text: raw });
+          logger.info(`[bot] forwarding slash command un-prefixed for ${sessionKey}: ${raw.slice(0, 80)}`);
+        } else {
+          const msgText = pending.replyContext
+            ? `${pending.replyContext}\n${pending.text || "(sent an attachment)"}`
+            : (pending.text || "(sent an attachment)");
+          const formattedMessage = formatUserMessage(pending.senderName, msgText);
+          allContentBlocks.push({ type: "text", text: formattedMessage });
+        }
         logInbound(sessionKey, pending.senderName, pending.text);
       } else {
         // Multiple messages — combine with separator
@@ -985,6 +1006,117 @@ export function createBot(
     }
   }
 
+  // ── Helper: download a video, extract evenly-spaced frames via ffmpeg, return
+  // them as image content blocks Claude can see. Requires ffmpeg + ffprobe on
+  // $PATH. Caps the video size at 20MB (Telegram bot getFile limit) and the
+  // frame count at MAX_VIDEO_FRAMES to keep context manageable.
+  const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
+  const MAX_VIDEO_FRAMES = 8;
+
+  async function downloadVideo(
+    ctx: Context,
+    msg: Context["message"] & object
+  ): Promise<ContentBlock[]> {
+    const video = msg.video!;
+    const fileId = video.file_id;
+    const file = await ctx.api.getFile(fileId);
+
+    const declaredSize = video.file_size ?? file.file_size ?? 0;
+    if (declaredSize > MAX_VIDEO_BYTES) {
+      const mb = Math.round(declaredSize / 1024 / 1024);
+      logger.warn(`[bot] Video too large (${mb}MB > ${MAX_VIDEO_BYTES / 1024 / 1024}MB)`);
+      return [{
+        type: "text",
+        text: `[Video too large (${mb}MB, max ${MAX_VIDEO_BYTES / 1024 / 1024}MB). Telegram bot API can't download files this big. Ask the user to send a shorter clip.]`,
+      }];
+    }
+
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+
+    const workdir = mkdtempSync(join(tmpdir(), "tg-video-"));
+    const videoPath = join(workdir, "input.mp4");
+    writeFileSync(videoPath, Buffer.from(buffer));
+
+    try {
+      // Probe duration
+      const probeOut = execFileSync(
+        "ffprobe",
+        ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", videoPath],
+        { encoding: "utf-8" }
+      ).trim();
+      const duration = parseFloat(probeOut);
+
+      if (!duration || isNaN(duration) || duration <= 0) {
+        throw new Error(`ffprobe returned unusable duration: "${probeOut}"`);
+      }
+
+      // Decide how many frames to extract — at least 4, at most MAX_VIDEO_FRAMES,
+      // roughly 1 per second for short clips.
+      const N = Math.min(MAX_VIDEO_FRAMES, Math.max(4, Math.round(duration)));
+      const fps = N / duration;
+
+      // Extract frames
+      execFileSync(
+        "ffmpeg",
+        [
+          "-i", videoPath,
+          "-vf", `fps=${fps.toFixed(6)}`,
+          "-frames:v", String(N),
+          "-q:v", "3",   // mid-high jpeg quality
+          join(workdir, "frame_%03d.jpg"),
+          "-y", "-loglevel", "error",
+        ],
+        { encoding: "utf-8" }
+      );
+
+      const frames = readdirSync(workdir)
+        .filter((f) => f.startsWith("frame_") && f.endsWith(".jpg"))
+        .sort();
+
+      if (frames.length === 0) {
+        throw new Error("ffmpeg produced no frames");
+      }
+
+      logger.info(
+        `[bot] Video processed: ${duration.toFixed(1)}s, ${frames.length} frame(s) extracted ` +
+        `(${Math.round(buffer.byteLength / 1024)}KB source)`
+      );
+
+      const blocks: ContentBlock[] = [
+        {
+          type: "text",
+          text:
+            `[Video received: ${duration.toFixed(1)}s long. ` +
+            `${frames.length} frames extracted at evenly-spaced intervals follow, in order.]`,
+        },
+      ];
+      for (const frameFile of frames) {
+        const frameData = readFileSync(join(workdir, frameFile));
+        blocks.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/jpeg",
+            data: frameData.toString("base64"),
+          },
+        });
+      }
+
+      return blocks;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`[bot] Video processing failed: ${msg}`);
+      return [{
+        type: "text",
+        text: `[Video could not be processed: ${msg}. The orchestrator received the file but ffmpeg failed to extract frames.]`,
+      }];
+    } finally {
+      try { rmSync(workdir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  }
+
   // ── Main message handler ──
   bot.on("message", async (ctx) => {
     const msg = ctx.message;
@@ -1006,12 +1138,13 @@ export function createBot(
         ["txt", "md", "markdown", "csv", "log", "json", "xml", "yaml", "yml"].includes(docExt)
       );
     const hasDocument = hasImageDocument || hasPdfDocument || hasTextDocument;
+    const hasVideo = !!msg.video;
 
     // Debug: log what we received
-    logger.info(`[bot] Message keys: ${Object.keys(msg).filter(k => !["from","chat","date","message_id"].includes(k)).join(", ")} | hasPhoto=${hasPhoto} hasImageDoc=${hasImageDocument} hasPdfDoc=${hasPdfDocument} hasTextDoc=${hasTextDocument} mime=${docMime}`);
+    logger.info(`[bot] Message keys: ${Object.keys(msg).filter(k => !["from","chat","date","message_id"].includes(k)).join(", ")} | hasPhoto=${hasPhoto} hasImageDoc=${hasImageDocument} hasPdfDoc=${hasPdfDocument} hasTextDoc=${hasTextDocument} hasVideo=${hasVideo} mime=${docMime}`);
 
     // Skip empty messages (stickers, etc. without text or photos)
-    if (!text.trim() && !hasPhoto && !hasDocument) return;
+    if (!text.trim() && !hasPhoto && !hasDocument && !hasVideo) return;
 
     const sessionKey = getSessionKey(ctx);
     if (!sessionKey) {
@@ -1021,18 +1154,38 @@ export function createBot(
 
     // ── Orchestrator-level slash commands (never batched) ──
     const trimmedText = text.trim();
-    if (trimmedText.startsWith("/")) {
+    if (isSlashCommand(trimmedText)) {
       const handled = await handleOrchestratorCommand(
         ctx, trimmedText, sessionKey, sessionManager, config, logger
       );
       if (handled) return;
 
-      // Claude Code commands — send raw without sender wrapping
-      const claudeCommands = ["/compact", "/cost", "/context", "/login", "/logout", "/doctor", "/memory"];
-      const cmd = trimmedText.split(/\s+/)[0].toLowerCase();
-      if (claudeCommands.includes(cmd)) {
-        logger.info(`[bot] Forwarding Claude command: ${trimmedText}`);
-        await ctx.replyWithChatAction("typing");
+      // Anything else starting with `/` is a Claude Code slash command
+      // (/goal, /clear, /compact, /cost, /context, custom user commands, …).
+      // These MUST be forwarded to Claude with NO `[SenderName]: ` prefix —
+      // Claude's slash-command parser only fires when the user message starts
+      // with `/`. Any prefix breaks dispatch.
+      //
+      // Flush any pending non-slash batch first so the slash command doesn't
+      // race with — or get bundled alongside — buffered messages. This keeps
+      // the contract: a slash command always arrives at Claude alone.
+      const existingBuf = sessionBuffers.get(sessionKey);
+      if (existingBuf) {
+        clearTimeout(existingBuf.timer);
+        sessionBuffers.delete(sessionKey);
+        logger.info(`[bot] Flushing ${existingBuf.messages.length} pending message(s) before slash command for ${sessionKey}`);
+        // Process the pending batch in the background; we don't await it
+        // because the user's slash command should fire immediately. The
+        // session backend serializes inbound messages internally.
+        processBatch(sessionKey, existingBuf.messages).catch((err) => {
+          const m = err instanceof Error ? err.message : String(err);
+          logger.error(`[bot] flushed-batch error for ${sessionKey}: ${m}`);
+        });
+      }
+
+      logger.info(`[bot] Forwarding slash command (un-prefixed) for ${sessionKey}: ${trimmedText.slice(0, 120)}`);
+      await ctx.replyWithChatAction("typing");
+      try {
         const response = await sessionManager.sendMessage(
           sessionKey,
           [{ type: "text", text: trimmedText }]
@@ -1046,8 +1199,12 @@ export function createBot(
             await ctx.reply(chunk, opts);
           }
         }
-        return;
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        logger.error(`[bot] slash-command forward failed for ${sessionKey}: ${m}`);
+        await ctx.reply(`Error running ${trimmedText.split(/\s+/)[0]}: ${m}`).catch(() => {});
       }
+      return;
     }
 
     const senderName = getSenderName(ctx);
@@ -1084,6 +1241,14 @@ export function createBot(
           text: `[Document received: ${fname}, but could not be loaded]`,
         });
       }
+    } else if (hasVideo) {
+      try {
+        const videoBlocks = await downloadVideo(ctx, msg);
+        for (const block of videoBlocks) contentBlocks.push(block);
+      } catch (err) {
+        logger.warn(`[bot] Failed to download/process video: ${err}`);
+        contentBlocks.push({ type: "text", text: "[Video received but could not be loaded]" });
+      }
     }
 
     // Extract reply-to context if this message is a reply
@@ -1107,7 +1272,9 @@ export function createBot(
       ? "(sent an image)"
       : (hasPdfDocument || hasTextDocument)
         ? `(sent a document: ${msg.document?.file_name ?? "document"})`
-        : "";
+        : hasVideo
+          ? "(sent a video)"
+          : "";
     const pending: PendingMessage = {
       ctx,
       text: text || defaultEmptyText,
