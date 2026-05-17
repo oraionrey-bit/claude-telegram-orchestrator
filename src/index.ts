@@ -8,7 +8,7 @@ import { initMemory } from "./memory";
 import { initChannelLogs } from "./channel-log";
 import { Scheduler } from "./scheduler";
 import { NotificationQueue } from "./notify";
-import { loadUserConfigs } from "./user-config";
+import { loadUserConfigs, ensureSessionBackend } from "./user-config";
 import { loadInflight, clearInflight } from "./inflight";
 import { startHttpServer } from "./http-server";
 import { Logger } from "./utils";
@@ -46,6 +46,12 @@ async function startOrchestrator(): Promise<void> {
   initMemory();
   initChannelLogs();
   loadUserConfigs();
+  // Opt Anthony's DM session into the tmux backend by default. ensureSessionBackend
+  // is idempotent — it only sets the value if no explicit choice has been made,
+  // so a /backend command Anthony issues later wins. This is the live test bed
+  // for the new tmux backend without disturbing other users (everyone else stays
+  // on the pipe backend).
+  ensureSessionBackend("dm-717932407", "tmux");
   logger.info("Memory, channel logs, and user configs initialized");
 
   // Get bot token
