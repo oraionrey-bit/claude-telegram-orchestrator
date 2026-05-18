@@ -20,6 +20,7 @@ import type {
   OnDeltaCallback,
   OnToolUseCallback,
   OnToolCompleteCallback,
+  OnUnsolicitedResponseCallback,
   SessionBackend,
   SpawnOpts,
 } from "./types";
@@ -172,6 +173,18 @@ export class PipeBackend implements SessionBackend {
 
   getMessageCount(): number {
     return this.state.messageCount;
+  }
+
+  /**
+   * PipeBackend always has its stdout reader running and only emits responses
+   * inside a sendMessage cycle (stream-json's "result" event closes the turn),
+   * so there's no equivalent of TmuxBackend's "Stop fired with nobody waiting"
+   * scenario. The handler is accepted for interface compatibility and stored
+   * in case we later choose to route something through it (e.g. assistant
+   * events that arrive after `result` from `--include-partial-messages`).
+   */
+  setUnsolicitedResponseHandler(_cb: OnUnsolicitedResponseCallback | null): void {
+    // intentionally no-op; see doc above
   }
 
   async kill(): Promise<void> {

@@ -35,6 +35,7 @@ import type {
   OnDeltaCallback,
   OnToolUseCallback,
   OnToolCompleteCallback,
+  OnUnsolicitedResponseCallback,
   SessionBackend,
   SpawnOpts,
 } from "./types";
@@ -193,6 +194,15 @@ export class TmuxBackend implements SessionBackend {
   // overlapping sends would both wait on `pendingTurn` and one would silently
   // hijack the other's response.
   private inflightChain: Promise<unknown> = Promise.resolve();
+  // Handler for assistant responses that arrive without a pending sendMessage
+  // — see SessionBackend.setUnsolicitedResponseHandler doc. Wired up by the
+  // SessionManager so the bot can forward sub-agent task-notification replies
+  // (and any other internally-triggered turns) to Telegram.
+  private unsolicitedHandler: OnUnsolicitedResponseCallback | null = null;
+  // Dedup guard for Stop events: occasionally the same Stop hook fires twice
+  // (e.g. tmux/hook timing quirks); we drop duplicates within this window.
+  private lastUnsolicitedText: string = "";
+  private lastUnsolicitedAt: number = 0;
 
   constructor(public readonly key: string, opts: SpawnOpts) {
     this.logger = opts.logger;
@@ -463,6 +473,10 @@ export class TmuxBackend implements SessionBackend {
     return this.messageCount;
   }
 
+  setUnsolicitedResponseHandler(cb: OnUnsolicitedResponseCallback | null): void {
+    this.unsolicitedHandler = cb;
+  }
+
   async kill(): Promise<void> {
     if (this.eventsWatcher) {
       try { this.eventsWatcher.close(); } catch { /* ok */ }
@@ -544,6 +558,17 @@ export class TmuxBackend implements SessionBackend {
       this.startTranscriptTail();
     }
 
+    // Stop is special: it can fire WITHOUT a pending sendMessage when an
+    // internally-triggered turn completes (most commonly: the Claude Code
+    // runtime injects a task-notification when a sub-agent finishes, the main
+    // session replies, and Stop fires without anyone waiting on it). Handle
+    // it before the early-return below so we don't drop those responses on
+    // the floor.
+    if (ev.event === "Stop") {
+      this.handleStopEvent(ev, turn);
+      return;
+    }
+
     if (!turn) return;
     turn.lastActivity = Date.now();
 
@@ -577,27 +602,78 @@ export class TmuxBackend implements SessionBackend {
         }
         break;
       }
+    }
+  }
 
-      case "Stop": {
-        // Only honor Stop AFTER we've seen the prompt for this turn.
-        if (!turn.promptSeen) {
-          this.logger.debug(`[tmux:${this.key}] Stop fired before UserPromptSubmit — ignoring`);
-          break;
-        }
-        // Use last_assistant_message as the authoritative response text. If
-        // empty or missing, fall back to whatever we accumulated from the
-        // transcript tail.
-        const text = (ev.payload.last_assistant_message ?? "").trim() || turn.accumulatedText;
-        // Fire one final delta with the complete text, in case the bot is
-        // doing streaming UI and hasn't seen the closing tail yet.
-        if (text && turn.callbacks.onDelta) {
-          try { turn.callbacks.onDelta(text); } catch { /* ignore */ }
-        }
-        this.logger.info(`[tmux:${this.key}] Response ready (${text.length} chars)`);
-        this.pendingTurn = null;
-        turn.resolve(text || "(no response)");
-        break;
+  /**
+   * Dispatch a Stop hook event to either the pending sendMessage promise OR
+   * the unsolicited-response handler, never both. Empty / tool-only Stops
+   * (no last_assistant_message) are ignored for unsolicited delivery — they
+   * carry no text and would just produce empty Telegram messages.
+   */
+  private handleStopEvent(ev: HookEvent, turn: PendingTurn | null): void {
+    const rawText = (ev.payload.last_assistant_message ?? "").trim();
+
+    // Case 1: there's an active sendMessage cycle for this turn — resolve it.
+    // We require promptSeen so that a stale Stop from a previous (now-unsolicited)
+    // turn doesn't hijack the response of the current sendMessage cycle.
+    if (turn && turn.promptSeen) {
+      turn.lastActivity = Date.now();
+      const text = rawText || turn.accumulatedText;
+      if (text && turn.callbacks.onDelta) {
+        try { turn.callbacks.onDelta(text); } catch { /* ignore */ }
       }
+      this.logger.info(`[tmux:${this.key}] Response ready (${text.length} chars)`);
+      this.pendingTurn = null;
+      turn.resolve(text || "(no response)");
+      return;
+    }
+
+    // Case 2: there's a pending turn but UserPromptSubmit hasn't landed yet
+    // for it. That means this Stop is leftover from BEFORE the current
+    // sendMessage's prompt — i.e. an unsolicited turn that completed during
+    // the brief window between us appending to the events file and the new
+    // turn starting. Deliver it as unsolicited and keep waiting for our turn.
+    if (turn && !turn.promptSeen) {
+      this.logger.debug(`[tmux:${this.key}] Stop fired before UserPromptSubmit for current turn — treating as unsolicited`);
+      this.dispatchUnsolicited(rawText);
+      return;
+    }
+
+    // Case 3: no pending sendMessage at all. Pure unsolicited response.
+    this.dispatchUnsolicited(rawText);
+  }
+
+  private dispatchUnsolicited(text: string): void {
+    if (!text) {
+      // Tool-only or otherwise empty Stop — nothing to deliver.
+      return;
+    }
+    // Dedup window: same text within 5s is almost certainly a duplicate Stop
+    // fire (we've seen this happen sporadically with the hook helper).
+    const now = Date.now();
+    if (text === this.lastUnsolicitedText && now - this.lastUnsolicitedAt < 5000) {
+      this.logger.debug(`[tmux:${this.key}] Dropping duplicate unsolicited Stop (${text.length} chars)`);
+      return;
+    }
+    this.lastUnsolicitedText = text;
+    this.lastUnsolicitedAt = now;
+    this.lastActivity = now;
+
+    if (!this.unsolicitedHandler) {
+      this.logger.warn(`[tmux:${this.key}] Unsolicited assistant response (${text.length} chars) but no handler registered — dropping`);
+      return;
+    }
+    this.logger.info(`[tmux:${this.key}] Forwarding unsolicited response (${text.length} chars)`);
+    try {
+      const r = this.unsolicitedHandler(text);
+      if (r && typeof (r as Promise<void>).then === "function") {
+        (r as Promise<void>).catch((err) => {
+          this.logger.warn(`[tmux:${this.key}] Unsolicited handler async error: ${err}`);
+        });
+      }
+    } catch (err) {
+      this.logger.warn(`[tmux:${this.key}] Unsolicited handler threw: ${err}`);
     }
   }
 

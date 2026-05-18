@@ -23,6 +23,7 @@ import type {
   OnDeltaCallback,
   OnToolUseCallback,
   OnToolCompleteCallback,
+  OnUnsolicitedResponseCallback,
 } from "./backends/types";
 import { PipeBackend } from "./backends/pipe";
 import { TmuxBackend } from "./backends/tmux";
@@ -30,7 +31,16 @@ import { getSessionBackend } from "./user-config";
 
 const LOGS_DIR = join(getConfigDir(), "logs", "sessions");
 
-export type { OnDeltaCallback, OnToolUseCallback, OnToolCompleteCallback };
+export type { OnDeltaCallback, OnToolUseCallback, OnToolCompleteCallback, OnUnsolicitedResponseCallback };
+
+/**
+ * Callback the bot registers with SessionManager to receive assistant
+ * responses that weren't initiated by a sendMessage call (e.g. the main
+ * Claude session replying to a sub-agent's task-notification). The
+ * SessionManager wires each backend's unsolicited stream to this handler
+ * automatically on spawn.
+ */
+export type SessionUnsolicitedHandler = (sessionKey: string, text: string) => void | Promise<void>;
 
 export class SessionManager {
   private sessions = new Map<string, SessionBackend>();
@@ -38,11 +48,28 @@ export class SessionManager {
   private config: OrchestratorConfig;
   private logger: Logger;
   private idleCheckInterval: ReturnType<typeof setInterval> | null = null;
+  // Set by the bot via setUnsolicitedHandler(). Receives any assistant text
+  // that arrives without a corresponding sendMessage() — see TmuxBackend.
+  private unsolicitedHandler: SessionUnsolicitedHandler | null = null;
 
   constructor(config: OrchestratorConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
     mkdirSync(LOGS_DIR, { recursive: true });
+  }
+
+  /**
+   * Register a handler that receives unsolicited assistant responses from any
+   * backend. Replaces any previously-registered handler and is applied to all
+   * currently-live backends as well as future spawns.
+   */
+  setUnsolicitedHandler(handler: SessionUnsolicitedHandler | null): void {
+    this.unsolicitedHandler = handler;
+    for (const [key, backend] of this.sessions) {
+      backend.setUnsolicitedResponseHandler(
+        handler ? (text: string) => handler(key, text) : null
+      );
+    }
   }
 
   /**
@@ -127,6 +154,14 @@ export class SessionManager {
       previousSessionId,
       logger: this.logger,
     });
+
+    // Wire the unsolicited-response handler BEFORE storing the backend, so a
+    // Stop event that fires moments after spawn (e.g. a leftover task-
+    // notification reply) is delivered rather than dropped.
+    if (this.unsolicitedHandler) {
+      const handler = this.unsolicitedHandler;
+      backend.setUnsolicitedResponseHandler((text: string) => handler(sessionKey, text));
+    }
 
     this.sessions.set(sessionKey, backend);
     return backend;

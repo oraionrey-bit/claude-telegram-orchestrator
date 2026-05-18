@@ -193,6 +193,55 @@ export function createBot(
   const bot = new Bot(token);
   const sessionBuffers = new Map<string, SessionBuffer>();
 
+  // ── Unsolicited response forwarding ──
+  //
+  // Some assistant responses are not triggered by a user message — most
+  // notably when a sub-agent finishes and the Claude Code runtime injects a
+  // task-notification that the main session replies to. Backends that surface
+  // those (TmuxBackend) call back here so we can deliver them to Telegram.
+  // Without this, sub-agent completion messages get stuck in the tmux pane
+  // and the user never sees them.
+  //
+  // Map session key → Telegram chat target. For DMs the chat_id equals the
+  // user_id baked into the session key. For groups the chat_id (and optional
+  // topic_id) are already in the key.
+  const resolveChatTarget = (sessionKey: string): { chatId: number; threadId?: number } | null => {
+    const parsed = parseSessionKey(sessionKey);
+    if (parsed.type === "dm") {
+      const userId = parsed.userId ? parseInt(parsed.userId, 10) : NaN;
+      if (Number.isNaN(userId)) return null;
+      return { chatId: userId };
+    }
+    if (parsed.type === "group" && parsed.chatId) {
+      const chatId = parseInt(parsed.chatId, 10);
+      if (Number.isNaN(chatId)) return null;
+      const threadId = parsed.topicId ? parseInt(parsed.topicId, 10) : undefined;
+      return { chatId, threadId: Number.isFinite(threadId as number) ? threadId : undefined };
+    }
+    return null;
+  };
+
+  sessionManager.setUnsolicitedHandler(async (sessionKey, text) => {
+    const trimmed = text?.trim();
+    if (!trimmed) return;
+    const target = resolveChatTarget(sessionKey);
+    if (!target) {
+      logger.warn(`[bot] Cannot resolve chat target for unsolicited response from ${sessionKey} — dropping (${trimmed.length} chars)`);
+      return;
+    }
+    logger.info(`[bot] Delivering unsolicited response from ${sessionKey} to chat ${target.chatId}${target.threadId ? `/topic ${target.threadId}` : ""} (${trimmed.length} chars)`);
+    logOutbound(sessionKey, trimmed);
+    // notifyQueue handles chunking (>4096 → split), 429 backoff, persistent
+    // retry, and fallback chats. Same delivery path that ack messages and
+    // reconciliation fallbacks use.
+    await notifyQueue.send({
+      chatId: target.chatId,
+      threadId: target.threadId,
+      text: trimmed,
+      tag: `unsolicited:${sessionKey}`,
+    });
+  });
+
   // ── Access control middleware ──
   bot.use(async (ctx, next) => {
     const userId = ctx.from?.id?.toString();

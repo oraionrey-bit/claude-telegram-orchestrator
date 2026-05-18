@@ -25,6 +25,15 @@ export type OnToolUseCallback = (toolName: string, description: string) => void;
 /** Fired when a tool finishes (durationMs measured from PreToolUse → PostToolUse). */
 export type OnToolCompleteCallback = (toolName: string, durationMs: number) => void;
 
+/**
+ * Fired when the backend observes an assistant turn that was NOT initiated by
+ * a sendMessage() call. This happens, e.g., when a sub-agent finishes and
+ * Claude Code injects a task-notification that the main session responds to —
+ * the response goes to the backend's transport but has no waiting consumer.
+ * The bot uses this to forward unsolicited responses to Telegram.
+ */
+export type OnUnsolicitedResponseCallback = (text: string) => void | Promise<void>;
+
 export interface BackendCallbacks {
   onDelta?: OnDeltaCallback;
   onToolUse?: OnToolUseCallback;
@@ -88,4 +97,12 @@ export interface SessionBackend {
 
   /** Kill the underlying process / tmux session. Resolves any pending response. */
   kill(): Promise<void>;
+
+  /**
+   * Register a callback invoked whenever the backend observes an assistant
+   * response that was NOT initiated by a sendMessage() call (e.g. main session
+   * replying to a sub-agent's task-notification). Calling this replaces any
+   * previously-registered callback. Pass `null` to clear.
+   */
+  setUnsolicitedResponseHandler(cb: OnUnsolicitedResponseCallback | null): void;
 }
